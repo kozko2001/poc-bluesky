@@ -33,7 +33,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max 
   update-manifests:
-    needs: deploy-raw
+    needs: deploy-poc
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     permissions:
