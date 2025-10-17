@@ -48,7 +48,7 @@ jobs:
         run: |
           # Update the image tag in deployment.yaml
           NEW_IMAGE=harbor.allocsoc.net/bluesky/poc:${{ github.sha }}
-          sed -i "s|image: .*|image: ${NEW_IMAGE}|" k8s/raw-cronjob.yaml
+          sed -i "s|image: .*|image: ${NEW_IMAGE}|" k8s/deployment.yaml
 
       - name: Commit and push changes
         run: |
