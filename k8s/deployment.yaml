@@ -15,7 +15,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: aggregator
-          image: ghcr.io/your-org/bluesky-firehose:latest
+          image: harbor.allocsoc.net/bluesky/poc:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: NODE_ENV
