@@ -15,7 +15,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: aggregator
-          image: harbor.allocsoc.net/bluesky/poc:latest
+          image: harbor.allocsoc.net/bluesky/poc:ea2e01bc70c1ac2a7962ebf5fba7ebe3762d8c2d
           imagePullPolicy: IfNotPresent
           env:
             - name: NODE_ENV
