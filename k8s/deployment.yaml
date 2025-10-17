@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bluesky-firehose
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bluesky-firehose
+  template:
+    metadata:
+      labels:
+        app: bluesky-firehose
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: aggregator
+          image: ghcr.io/your-org/bluesky-firehose:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: STATE_FILE
+              value: /data/aggregator-db
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: bluesky-firehose-data

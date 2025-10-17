@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - pvc.yaml
+  - deployment.yaml
+
+namespace: bluesky-firehose
+
+labels:
+  - includeSelectors: true
+    pairs:
+      app.kubernetes.io/name: bluesky-firehose
+      app.kubernetes.io/version: 1.0.0
