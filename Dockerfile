@@ -15,6 +15,7 @@ FROM node:20-slim AS runner
 
 ENV NODE_ENV=production \
     STATE_FILE=/data/aggregator-db
+    SNAPSHOT_DIR=/data/aggregator-snapshot
 
 WORKDIR /app
 
