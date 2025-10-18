@@ -13,6 +13,9 @@ spec:
         app: bluesky-firehose
     spec:
       terminationGracePeriodSeconds: 30
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: aggregator
           image: harbor.allocsoc.net/bluesky/poc:ea2e01bc70c1ac2a7962ebf5fba7ebe3762d8c2d
@@ -25,10 +28,10 @@ spec:
           resources:
             requests:
               cpu: "100m"
-              memory: "256Mi"
+              memory: "512Mi"
             limits:
               cpu: "500m"
-              memory: "512Mi"
+              memory: "1024Mi"
           volumeMounts:
             - name: data
               mountPath: /data

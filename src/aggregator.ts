@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import WebSocket from 'ws';
 import { Level } from 'level';
@@ -22,12 +23,23 @@ const JETSTREAM_URL = 'wss://jetstream2.us-east.bsky.network/subscribe';
 const DEFAULT_REPORT_INTERVAL_MS = 30_000;
 const DEFAULT_TOP_COUNT = 10;
 const DEFAULT_MAX_TRACKED_POSTS = 100_000;
-const DEFAULT_STALE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_WINDOW_HOURS = 24;
+const DEFAULT_HALF_LIFE_HOURS = 3;
+const DEFAULT_SNAPSHOT_INTERVAL_MS = 10 * 60 * 1000;
 const DEFAULT_DB_PATH = './data/aggregator-db';
+const DEFAULT_SNAPSHOT_DIR = './data/aggregator-snapshots';
+const DEFAULT_MAX_ACTIVE_LIKES = 200_000;
+const DEFAULT_MAX_ACTIVE_REPOSTS = 120_000;
+const REPOST_WEIGHT = 2;
+
+const META_NEXT_POST_ID_KEY = 'meta:nextPostId';
+const POST_ID_LOOKUP_PREFIX = 'postid:';
+const POST_URI_PREFIX = 'posturi:';
 
 const POST_PREFIX = 'post:';
 const LIKE_PREFIX = 'like:';
 const REPOST_PREFIX = 'repost:';
+const POST_URL_PREFIX = 'posturl:';
 
 interface JetstreamCommit {
   rev: string;
@@ -49,12 +61,22 @@ interface PostStats {
   likes: number;
   reposts: number;
   lastUpdated: number;
+  id: number;
 }
 
 interface PersistedPostStats {
   likes: number;
   reposts: number;
   lastUpdated: number;
+  id?: number;
+}
+
+interface RankedPost {
+  uri: string;
+  stats: PostStats;
+  score: number;
+  hotness: number;
+  url: string | null;
 }
 
 type ArgMap = Record<string, string | boolean>;
@@ -63,6 +85,69 @@ interface AtUriParts {
   did: string;
   collection: string;
   rkey: string;
+}
+
+class LruCache<K, V> {
+  private readonly maxSize: number;
+  private readonly store = new Map<K, V>();
+
+  constructor(limit: number) {
+    this.maxSize = Math.max(0, limit);
+  }
+
+  get(key: K): V | undefined {
+    const value = this.store.get(key);
+    if (value === undefined) return undefined;
+    this.store.delete(key);
+    this.store.set(key, value);
+    return value;
+  }
+
+  set(key: K, value: V): void {
+    if (this.maxSize === 0) return;
+    if (this.store.has(key)) {
+      this.store.delete(key);
+    }
+    this.store.set(key, value);
+    if (this.store.size > this.maxSize) {
+      const oldestKey = this.store.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.store.delete(oldestKey);
+      }
+    }
+  }
+
+  delete(key: K): boolean {
+    return this.store.delete(key);
+  }
+
+  has(key: K): boolean {
+    return this.store.has(key);
+  }
+
+  clear(): void {
+    this.store.clear();
+  }
+
+  size(): number {
+    return this.store.size;
+  }
+
+  entries(): IterableIterator<[K, V]> {
+    return this.store.entries();
+  }
+
+  keys(): IterableIterator<K> {
+    return this.store.keys();
+  }
+
+  values(): IterableIterator<V> {
+    return this.store.values();
+  }
+
+  [Symbol.iterator](): IterableIterator<[K, V]> {
+    return this.store[Symbol.iterator]();
+  }
 }
 
 const args = process.argv.slice(2);
@@ -103,6 +188,10 @@ function toPostUrl(uri: string): string | null {
 
 const parsedArgs = parseArgs(args);
 
+function hasFlag(flag: string): boolean {
+  return Object.prototype.hasOwnProperty.call(parsedArgs, flag);
+}
+
 function getNumberArg(flag: string, defaultValue: number): number {
   const raw = parsedArgs[flag];
   if (typeof raw === 'string') {
@@ -125,12 +214,27 @@ function getStringArg(flag: string, defaultValue: string): string {
 const reportIntervalMs = getNumberArg('--interval-ms', DEFAULT_REPORT_INTERVAL_MS);
 const topCount = Math.max(1, Math.floor(getNumberArg('--top', DEFAULT_TOP_COUNT)));
 const maxTrackedPosts = Math.max(1000, Math.floor(getNumberArg('--max-posts', DEFAULT_MAX_TRACKED_POSTS)));
-const staleIntervalMs = getNumberArg('--stale-ms', DEFAULT_STALE_INTERVAL_MS);
+const windowHours = Math.max(1, Math.floor(getNumberArg('--window-hours', DEFAULT_WINDOW_HOURS)));
+const baseRetentionMs = windowHours * 60 * 60 * 1000;
+let staleIntervalMs = baseRetentionMs;
+if (hasFlag('--stale-ms')) {
+  staleIntervalMs = getNumberArg('--stale-ms', staleIntervalMs);
+}
+const maxPostAgeMs = staleIntervalMs;
+const halfLifeHours = Math.max(0.25, getNumberArg('--half-life-hours', DEFAULT_HALF_LIFE_HOURS));
+const snapshotIntervalMs = Math.max(60_000, getNumberArg('--snapshot-interval-ms', DEFAULT_SNAPSHOT_INTERVAL_MS));
+const environmentSnapshotPath = process.env.SNAPSHOT_DIR && process.env.SNAPSHOT_DIR.trim().length > 0
+  ? process.env.SNAPSHOT_DIR.trim()
+  : DEFAULT_SNAPSHOT_DIR;
+const snapshotDirArg = getStringArg('--snapshot-dir', environmentSnapshotPath);
+const snapshotDir = path.isAbsolute(snapshotDirArg) ? snapshotDirArg : path.resolve(process.cwd(), snapshotDirArg);
 const environmentDbPath = process.env.STATE_FILE && process.env.STATE_FILE.trim().length > 0
   ? process.env.STATE_FILE.trim()
   : DEFAULT_DB_PATH;
 const dbPathArg = getStringArg('--state', environmentDbPath);
 const dbPath = path.isAbsolute(dbPathArg) ? dbPathArg : path.resolve(process.cwd(), dbPathArg);
+const maxActiveLikes = Math.max(1_000, Math.floor(getNumberArg('--max-active-likes', DEFAULT_MAX_ACTIVE_LIKES)));
+const maxActiveReposts = Math.max(1_000, Math.floor(getNumberArg('--max-active-reposts', DEFAULT_MAX_ACTIVE_REPOSTS)));
 
 if (parsedArgs['--help'] || parsedArgs['-h']) {
   console.log(`
@@ -145,8 +249,15 @@ ${colors.bright}Options:${colors.reset}
   --interval-ms <ms>   Reporting interval in milliseconds (default ${DEFAULT_REPORT_INTERVAL_MS})
   --top <n>            Number of top posts to display per report (default ${DEFAULT_TOP_COUNT})
   --max-posts <n>      Maximum posts to track in memory (default ${DEFAULT_MAX_TRACKED_POSTS})
-  --stale-ms <ms>      Drop posts inactive for this long (default ${DEFAULT_STALE_INTERVAL_MS})
+  --window-hours <h>   Hotness/retention window in hours (default ${DEFAULT_WINDOW_HOURS})
+  --half-life-hours <h> Hotness half-life in hours (default ${DEFAULT_HALF_LIFE_HOURS})
+  --snapshot-interval-ms <ms>
+                       Snapshot interval in milliseconds (default ${DEFAULT_SNAPSHOT_INTERVAL_MS})
+  --snapshot-dir <path> Directory for 10-minute snapshots (default ${DEFAULT_SNAPSHOT_DIR}, overridable via SNAPSHOT_DIR env)
+  --stale-ms <ms>      Override retention window directly (advanced)
   --state <path>       LevelDB database directory (default ${DEFAULT_DB_PATH}, overridable via STATE_FILE env)
+  --max-active-likes <n> Max in-memory like entries before falling back to LevelDB (default ${DEFAULT_MAX_ACTIVE_LIKES})
+  --max-active-reposts <n> Max in-memory repost entries before falling back to LevelDB (default ${DEFAULT_MAX_ACTIVE_REPOSTS})
   --help, -h           Show this help message
 `);
   process.exit(0);
@@ -156,19 +267,39 @@ console.log(`${colors.bright}${colors.blue}Bluesky Like/Repost Aggregator${color
 console.log(`${colors.gray}Endpoint: ${JETSTREAM_URL}${colors.reset}`);
 console.log(`${colors.gray}Database path: ${dbPath}${colors.reset}`);
 console.log(`${colors.gray}Report interval: ${(reportIntervalMs / 1000).toFixed(1)}s, top ${topCount} posts${colors.reset}`);
-console.log(`${colors.gray}Tracking up to ${maxTrackedPosts.toLocaleString()} posts; stale after ${(staleIntervalMs / 1000 / 60).toFixed(1)} minutes${colors.reset}`);
+console.log(`${colors.gray}Tracking up to ${maxTrackedPosts.toLocaleString()} posts; retention ${(maxPostAgeMs / 1000 / 60 / 60).toFixed(1)} hours (half-life ${halfLifeHours.toFixed(1)}h)${colors.reset}`);
+console.log(`${colors.gray}Snapshots every ${(snapshotIntervalMs / 1000 / 60).toFixed(1)} minutes → ${snapshotDir}${colors.reset}`);
+console.log(`${colors.gray}Active cache limits: likes ≤ ${maxActiveLikes.toLocaleString()}, reposts ≤ ${maxActiveReposts.toLocaleString()}${colors.reset}`);
 console.log(`${colors.gray}${'='.repeat(80)}${colors.reset}\n`);
 
 const postStats = new Map<string, PostStats>();
-const activeLikes = new Map<string, string>();
-const activeReposts = new Map<string, string>();
+const activeLikes = new LruCache<string, number>(maxActiveLikes);
+const activeReposts = new LruCache<string, number>(maxActiveReposts);
+const postIdByUri = new Map<string, number>();
+const uriByPostId = new Map<number, string>();
+const postUrlById = new Map<number, string | null>();
 
 let reportTimer: NodeJS.Timeout | null = null;
 let pruneTimer: NodeJS.Timeout | null = null;
+let snapshotTimer: NodeJS.Timeout | null = null;
 let lastCpuUsage: NodeJS.CpuUsage | null = null;
 let lastReportTime: number | null = null;
 let shuttingDown = false;
 let db: Level<string, unknown>;
+let snapshotQueue: Promise<void> = Promise.resolve();
+let nextPostId = 1;
+
+function calculateScore(stats: PostStats): number {
+  return stats.likes + REPOST_WEIGHT * stats.reposts;
+}
+
+function calculateHotness(stats: PostStats, now: number): number {
+  const baseScore = calculateScore(stats);
+  if (baseScore <= 0) return 0;
+  const ageHours = Math.max(0, (now - stats.lastUpdated) / (60 * 60 * 1000));
+  const decayFactor = Math.exp(-ageHours / halfLifeHours);
+  return Number.isFinite(decayFactor) ? baseScore * decayFactor : baseScore;
+}
 
 function formatTimestamp(): string {
   return `${colors.gray}[${new Date().toISOString()}]${colors.reset}`;
@@ -190,6 +321,141 @@ function repostKey(id: string): string {
   return `${REPOST_PREFIX}${id}`;
 }
 
+function postIdLookupKey(uri: string): string {
+  return `${POST_ID_LOOKUP_PREFIX}${uri}`;
+}
+
+function postUriKey(id: number): string {
+  return `${POST_URI_PREFIX}${id}`;
+}
+
+function postUrlKey(id: number): string {
+  return `${POST_URL_PREFIX}${id}`;
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return Boolean(
+    error &&
+    typeof error === 'object' &&
+    'notFound' in error &&
+    (error as { notFound?: boolean }).notFound
+  );
+}
+
+function resolvePostUrl(postId: number, uri: string): string | null {
+  const cached = postUrlById.get(postId);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const computed = toPostUrl(uri);
+  postUrlById.set(postId, computed ?? null);
+  if (computed) {
+    void putKey(postUrlKey(postId), computed);
+  } else {
+    void delKey(postUrlKey(postId));
+  }
+  return computed ?? null;
+}
+
+function rememberPostId(postUri: string, postId: number, options?: { persist?: boolean; postUrl?: string | null }): void {
+  let postUrl: string | null;
+  if (options && Object.prototype.hasOwnProperty.call(options, 'postUrl')) {
+    postUrl = options.postUrl ?? null;
+  } else {
+    postUrl = toPostUrl(postUri);
+  }
+  postIdByUri.set(postUri, postId);
+  uriByPostId.set(postId, postUri);
+  postUrlById.set(postId, postUrl ?? null);
+  if (options?.persist === false) {
+    return;
+  }
+  void putKey(postIdLookupKey(postUri), postId);
+  void putKey(postUriKey(postId), postUri);
+  if (postUrl) {
+    void putKey(postUrlKey(postId), postUrl);
+  } else {
+    void delKey(postUrlKey(postId));
+  }
+}
+
+function allocatePostId(postUri: string): number {
+  const existing = postIdByUri.get(postUri);
+  if (existing !== undefined) {
+    return existing;
+  }
+  const id = nextPostId++;
+  rememberPostId(postUri, id);
+  void putKey(META_NEXT_POST_ID_KEY, nextPostId);
+  return id;
+}
+
+async function removePostId(postUri: string, postId: number): Promise<void> {
+  postIdByUri.delete(postUri);
+  uriByPostId.delete(postId);
+  postUrlById.delete(postId);
+  await delKey(postIdLookupKey(postUri));
+  await delKey(postUriKey(postId));
+  await delKey(postUrlKey(postId));
+}
+
+async function resolveActiveAssociation(
+  cache: LruCache<string, number>,
+  cacheKey: string,
+  storageKey: string
+): Promise<number | undefined> {
+  const cached = cache.get(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  try {
+    const stored = await db.get(storageKey);
+    let postId: number | undefined;
+    if (typeof stored === 'number') {
+      postId = stored;
+    } else if (typeof stored === 'string') {
+      postId = postIdByUri.get(stored);
+      if (postId !== undefined) {
+        void putKey(storageKey, postId);
+      }
+    }
+    if (postId !== undefined) {
+      cache.set(cacheKey, postId);
+      return postId;
+    }
+  } catch (error) {
+    if (!isNotFoundError(error)) {
+      console.error(`${colors.red}Failed to load association for ${storageKey}:${colors.reset}`, error);
+    }
+  }
+  return undefined;
+}
+
+async function purgePersistedAssociationsByPostId(
+  prefix: string,
+  targetIds: Set<number>,
+  skipKeys?: Set<string>
+): Promise<void> {
+  if (targetIds.size === 0) return;
+  const upperBound = `${prefix}\uffff`;
+  for await (const [key, value] of db.iterator({ gte: prefix, lt: upperBound })) {
+    if (skipKeys?.has(key)) {
+      continue;
+    }
+    if (typeof value === 'number') {
+      if (targetIds.has(value)) {
+        await delKey(key);
+      }
+    } else if (typeof value === 'string') {
+      const postId = postIdByUri.get(value);
+      if (postId !== undefined && targetIds.has(postId)) {
+        await delKey(key);
+      }
+    }
+  }
+}
+
 async function putKey(key: string, value: unknown): Promise<void> {
   try {
     await db.put(key, value);
@@ -208,43 +474,55 @@ async function delKey(key: string): Promise<void> {
 
 function ensurePostStats(postUri: string): PostStats {
   let stats = postStats.get(postUri);
+  const now = Date.now();
   if (!stats) {
-    stats = { likes: 0, reposts: 0, lastUpdated: Date.now() };
+    const postId = postIdByUri.get(postUri) ?? allocatePostId(postUri);
+    stats = { likes: 0, reposts: 0, lastUpdated: now, id: postId };
     postStats.set(postUri, stats);
   } else {
-    stats.lastUpdated = Date.now();
+    stats.lastUpdated = now;
   }
   return stats;
 }
 
-async function cleanupActiveMaps(removedUris: string[]): Promise<void> {
-  if (removedUris.length === 0) return;
-  const uriSet = new Set(removedUris);
+async function cleanupActiveMaps(removedPostIds: number[]): Promise<void> {
+  if (removedPostIds.length === 0) return;
+  const idSet = new Set(removedPostIds);
+  const deletedLikeKeys = new Set<string>();
+  const deletedRepostKeys = new Set<string>();
 
-  for (const [key, uri] of activeLikes) {
-    if (uriSet.has(uri)) {
+  for (const [key, postId] of Array.from(activeLikes.entries())) {
+    if (idSet.has(postId)) {
       activeLikes.delete(key);
-      await delKey(likeKey(key));
+      const storageKey = likeKey(key);
+      deletedLikeKeys.add(storageKey);
+      await delKey(storageKey);
     }
   }
 
-  for (const [key, uri] of activeReposts) {
-    if (uriSet.has(uri)) {
+  for (const [key, postId] of Array.from(activeReposts.entries())) {
+    if (idSet.has(postId)) {
       activeReposts.delete(key);
-      await delKey(repostKey(key));
+      const storageKey = repostKey(key);
+      deletedRepostKeys.add(storageKey);
+      await delKey(storageKey);
     }
   }
+
+  await purgePersistedAssociationsByPostId(LIKE_PREFIX, idSet, deletedLikeKeys);
+  await purgePersistedAssociationsByPostId(REPOST_PREFIX, idSet, deletedRepostKeys);
 }
 
 async function pruneInactivePosts(): Promise<void> {
-  const removed: string[] = [];
+  const removedIds: number[] = [];
   const now = Date.now();
 
   for (const [uri, stats] of postStats) {
-    if (now - stats.lastUpdated > staleIntervalMs) {
+    if (now - stats.lastUpdated > maxPostAgeMs) {
       postStats.delete(uri);
-      removed.push(uri);
+      removedIds.push(stats.id);
       await delKey(postKey(uri));
+      await removePostId(uri, stats.id);
     }
   }
 
@@ -255,19 +533,21 @@ async function pruneInactivePosts(): Promise<void> {
     );
     for (let i = 0; i < excess; i++) {
       const [uri] = entries[i];
-      if (postStats.delete(uri)) {
-        removed.push(uri);
+      const stats = postStats.get(uri);
+      if (stats && postStats.delete(uri)) {
+        removedIds.push(stats.id);
         await delKey(postKey(uri));
+        await removePostId(uri, stats.id);
       }
     }
   }
 
-  await cleanupActiveMaps(removed);
+  await cleanupActiveMaps(removedIds);
 }
 
 function schedulePruning(): void {
   if (pruneTimer) return;
-  const interval = Math.max(15_000, Math.min(5 * reportIntervalMs, staleIntervalMs));
+  const interval = Math.max(15_000, Math.min(5 * reportIntervalMs, maxPostAgeMs));
   pruneTimer = setInterval(() => {
     void pruneInactivePosts();
   }, interval);
@@ -283,6 +563,7 @@ function adjustLikeCount(postUri: string, delta: number): void {
   if (stats.likes === 0 && stats.reposts === 0) {
     postStats.delete(postUri);
     void delKey(postKey(postUri));
+    void removePostId(postUri, stats.id);
   } else {
     void putKey(postKey(postUri), { ...stats });
   }
@@ -298,6 +579,7 @@ function adjustRepostCount(postUri: string, delta: number): void {
   if (stats.likes === 0 && stats.reposts === 0) {
     postStats.delete(postUri);
     void delKey(postKey(postUri));
+    void removePostId(postUri, stats.id);
   } else {
     void putKey(postKey(postUri), { ...stats });
   }
@@ -310,6 +592,10 @@ function reportTopPosts(reason: string): void {
 
   const rssMb = formatMB(memory.rss);
   const heapMb = formatMB(memory.heapUsed);
+  const likeCacheSize = activeLikes.size().toLocaleString();
+  const repostCacheSize = activeReposts.size().toLocaleString();
+  const likeCacheLimit = maxActiveLikes.toLocaleString();
+  const repostCacheLimit = maxActiveReposts.toLocaleString();
 
   let cpuDisplay = 'n/a';
   if (lastCpuUsage && lastReportTime) {
@@ -329,7 +615,9 @@ function reportTopPosts(reason: string): void {
   console.log(`${formatTimestamp()} ${colors.bright}${reason}:${colors.reset}`);
   console.log(
     `  ${colors.dim}Resources${colors.reset}: RSS ${colors.white}${rssMb} MB${colors.reset}, ` +
-    `Heap ${colors.white}${heapMb} MB${colors.reset}, CPU ${colors.white}${cpuDisplay}${colors.reset}`
+    `Heap ${colors.white}${heapMb} MB${colors.reset}, CPU ${colors.white}${cpuDisplay}${colors.reset}, ` +
+    `Likes cache ${colors.white}${likeCacheSize}${colors.reset}/${likeCacheLimit}, ` +
+    `Reposts cache ${colors.white}${repostCacheSize}${colors.reset}/${repostCacheLimit}`
   );
 
   if (postStats.size === 0) {
@@ -337,40 +625,110 @@ function reportTopPosts(reason: string): void {
     return;
   }
 
-  const entries = Array.from(postStats.entries());
-  entries.sort((a, b) => {
-    const scoreA = a[1].likes + a[1].reposts;
-    const scoreB = b[1].likes + b[1].reposts;
-    if (scoreA === scoreB) {
-      return b[1].lastUpdated - a[1].lastUpdated;
-    }
-    return scoreB - scoreA;
-  });
-
-  const topEntries = entries.slice(0, topCount);
-  for (const [uri, stats] of topEntries) {
+  const topEntries = getRankedPosts(topCount, now);
+  for (const entry of topEntries) {
+    const { uri, stats, score, hotness, url } = entry;
     const likePart = `${colors.magenta}${stats.likes} like${stats.likes === 1 ? '' : 's'}${colors.reset}`;
     const repostPart = `${colors.yellow}${stats.reposts} repost${stats.reposts === 1 ? '' : 's'}${colors.reset}`;
-    const url = toPostUrl(uri);
     const location = url
       ? `${colors.cyan}${url}${colors.reset} ${colors.dim}(${uri})${colors.reset}`
       : `${colors.cyan}${uri}${colors.reset}`;
     console.log(
-      `  ${location} — ${likePart}, ${repostPart} (updated ${new Date(stats.lastUpdated).toISOString()})`
+      `  ${location} — ${likePart}, ${repostPart}, score ${colors.white}${score}${colors.reset}, hotness ${colors.white}${hotness.toFixed(2)}${colors.reset} (updated ${new Date(stats.lastUpdated).toISOString()})`
     );
   }
   console.log('');
 }
 
-function handleLike(event: JetstreamEvent, commit: JetstreamCommit): void {
+function getRankedPosts(limit: number, now: number): RankedPost[] {
+  const ranked: RankedPost[] = [];
+  for (const [uri, stats] of postStats) {
+    const score = calculateScore(stats);
+    const hotness = calculateHotness(stats, now);
+    const url = resolvePostUrl(stats.id, uri);
+    ranked.push({
+      uri,
+      stats,
+      score,
+      hotness,
+      url,
+    });
+  }
+
+  ranked.sort((a, b) => {
+    if (b.hotness !== a.hotness) return b.hotness - a.hotness;
+    if (b.score !== a.score) return b.score - a.score;
+    return b.stats.lastUpdated - a.stats.lastUpdated;
+  });
+
+  return ranked.slice(0, limit);
+}
+
+function snapshotPath(timestamp: number): { directory: string; filePath: string } {
+  const iso = new Date(timestamp).toISOString();
+  const day = iso.slice(0, 10);
+  const timePart = iso.slice(11, 16).replace(':', '-');
+  const directory = path.join(snapshotDir, day);
+  const filePath = path.join(directory, `${day}T${timePart}Z.json`);
+  return { directory, filePath };
+}
+
+async function writeSnapshot(reason: string): Promise<void> {
+  const now = Date.now();
+  const ranked = getRankedPosts(topCount, now);
+  const payload = {
+    generatedAt: new Date(now).toISOString(),
+    reason,
+    windowHours,
+    halfLifeHours,
+    topCount: ranked.length,
+    posts: ranked.map((entry, index) => ({
+      rank: index + 1,
+      uri: entry.uri,
+      url: entry.url,
+      postId: entry.stats.id,
+      likes: entry.stats.likes,
+      reposts: entry.stats.reposts,
+      score: entry.score,
+      hotness: Number(entry.hotness.toFixed(6)),
+      lastUpdated: new Date(entry.stats.lastUpdated).toISOString(),
+    })),
+  };
+
+  try {
+    const { directory, filePath } = snapshotPath(now);
+    await fs.mkdir(directory, { recursive: true });
+    await fs.writeFile(filePath, JSON.stringify(payload, null, 2), 'utf8');
+    console.log(`${formatTimestamp()} ${colors.dim}Snapshot saved (${reason}): ${filePath}${colors.reset}`);
+  } catch (error) {
+    console.error(`${colors.red}Failed to write snapshot:${colors.reset}`, error);
+  }
+}
+
+function queueSnapshot(reason: string): void {
+  snapshotQueue = snapshotQueue.then(() => writeSnapshot(reason));
+}
+
+function scheduleSnapshots(): void {
+  if (snapshotTimer) return;
+  snapshotTimer = setInterval(() => {
+    queueSnapshot('Periodic snapshot');
+  }, snapshotIntervalMs);
+}
+
+async function handleLike(event: JetstreamEvent, commit: JetstreamCommit): Promise<void> {
   const key = `${event.did}/${commit.rkey}`;
+  const storageKey = likeKey(key);
 
   if (commit.operation === 'delete') {
-    const subjectUri = activeLikes.get(key);
-    if (subjectUri) {
-      adjustLikeCount(subjectUri, -1);
+    const postId = await resolveActiveAssociation(activeLikes, key, storageKey);
+    if (postId !== undefined) {
+      const subjectUri = uriByPostId.get(postId);
+      if (subjectUri) {
+        adjustLikeCount(subjectUri, -1);
+      }
       activeLikes.delete(key);
-      void delKey(likeKey(key));
+      await delKey(storageKey);
     }
     return;
   }
@@ -379,20 +737,25 @@ function handleLike(event: JetstreamEvent, commit: JetstreamCommit): void {
   const subjectUri = commit.record?.subject?.uri;
   if (!subjectUri) return;
 
+  const stats = ensurePostStats(subjectUri);
   adjustLikeCount(subjectUri, 1);
-  activeLikes.set(key, subjectUri);
-  void putKey(likeKey(key), subjectUri);
+  activeLikes.set(key, stats.id);
+  void putKey(storageKey, stats.id);
 }
 
-function handleRepost(event: JetstreamEvent, commit: JetstreamCommit): void {
+async function handleRepost(event: JetstreamEvent, commit: JetstreamCommit): Promise<void> {
   const key = `${event.did}/${commit.rkey}`;
+  const storageKey = repostKey(key);
 
   if (commit.operation === 'delete') {
-    const subjectUri = activeReposts.get(key);
-    if (subjectUri) {
-      adjustRepostCount(subjectUri, -1);
+    const postId = await resolveActiveAssociation(activeReposts, key, storageKey);
+    if (postId !== undefined) {
+      const subjectUri = uriByPostId.get(postId);
+      if (subjectUri) {
+        adjustRepostCount(subjectUri, -1);
+      }
       activeReposts.delete(key);
-      void delKey(repostKey(key));
+      await delKey(storageKey);
     }
     return;
   }
@@ -401,21 +764,22 @@ function handleRepost(event: JetstreamEvent, commit: JetstreamCommit): void {
   const subjectUri = commit.record?.subject?.uri;
   if (!subjectUri) return;
 
+  const stats = ensurePostStats(subjectUri);
   adjustRepostCount(subjectUri, 1);
-  activeReposts.set(key, subjectUri);
-  void putKey(repostKey(key), subjectUri);
+  activeReposts.set(key, stats.id);
+  void putKey(storageKey, stats.id);
 }
 
-function handleCommitEvent(event: JetstreamEvent): void {
+async function handleCommitEvent(event: JetstreamEvent): Promise<void> {
   const commit = event.commit;
   if (!commit) return;
 
   switch (commit.collection) {
     case 'app.bsky.feed.like':
-      handleLike(event, commit);
+      await handleLike(event, commit);
       break;
     case 'app.bsky.feed.repost':
-      handleRepost(event, commit);
+      await handleRepost(event, commit);
       break;
     default:
       break;
@@ -434,13 +798,17 @@ function connect(): void {
       }, reportIntervalMs);
     }
     schedulePruning();
+    scheduleSnapshots();
+    queueSnapshot('Connected snapshot');
   });
 
   ws.on('message', (data: WebSocket.Data) => {
     try {
       const event: JetstreamEvent = JSON.parse(data.toString());
       if (event.kind !== 'commit' || !event.commit) return;
-      handleCommitEvent(event);
+      void handleCommitEvent(event).catch((error) => {
+        console.error(`${colors.red}Failed to handle commit event:${colors.reset}`, error);
+      });
     } catch (error) {
       console.error(`${colors.red}Failed to parse event:${colors.reset}`, error);
     }
@@ -461,11 +829,80 @@ async function loadState(): Promise<void> {
   const now = Date.now();
   let loadedPosts = 0;
   let removedStale = 0;
-  const pendingLikes: Array<[string, string]> = [];
-  const pendingReposts: Array<[string, string]> = [];
+  const pendingLikes: Array<[string, string | number]> = [];
+  const pendingReposts: Array<[string, string | number]> = [];
+  const restoredPosts: Array<{ uri: string; likes: number; reposts: number; lastUpdated: number; persistedId?: number }> = [];
+  const pendingIdByUri = new Map<string, number>();
+  const pendingUriById = new Map<number, string>();
+  const pendingUrlById = new Map<number, string | null>();
+  const seenPostIds = new Set<number>();
+  let storedNextPostId: number | null = null;
 
   for await (const [key, value] of db.iterator()) {
     if (typeof key !== 'string') continue;
+
+    if (key === META_NEXT_POST_ID_KEY) {
+      const numeric = Number(value);
+      if (!Number.isNaN(numeric) && numeric > 0) {
+        storedNextPostId = Math.max(storedNextPostId ?? 0, Math.floor(numeric));
+      } else {
+        await delKey(key);
+      }
+      continue;
+    }
+
+    if (key.startsWith(POST_URI_PREFIX)) {
+      const idValue = Number(key.slice(POST_URI_PREFIX.length));
+      const metaValue = value as unknown;
+      let uri: string | undefined;
+      let url: string | null | undefined;
+      if (typeof metaValue === 'string') {
+        uri = metaValue;
+      } else if (metaValue && typeof metaValue === 'object') {
+        const meta = metaValue as { uri?: unknown; url?: unknown };
+        if (typeof meta.uri === 'string') uri = meta.uri;
+        if (typeof meta.url === 'string') url = meta.url;
+        if (meta.url === null) url = null;
+      }
+      if (uri && Number.isInteger(idValue) && idValue > 0) {
+        pendingUriById.set(idValue, uri);
+        if (url !== undefined) pendingUrlById.set(idValue, url);
+        seenPostIds.add(idValue);
+      } else {
+        await delKey(key);
+      }
+      continue;
+    }
+
+    if (key.startsWith(POST_URL_PREFIX)) {
+      const idValue = Number(key.slice(POST_URL_PREFIX.length));
+      if (Number.isInteger(idValue) && idValue > 0) {
+        const storedUrl = typeof value === 'string'
+          ? value
+          : value === null
+            ? null
+            : undefined;
+        if (storedUrl !== undefined) {
+          pendingUrlById.set(idValue, storedUrl === '' ? null : storedUrl);
+          seenPostIds.add(idValue);
+        }
+      } else {
+        await delKey(key);
+      }
+      continue;
+    }
+
+    if (key.startsWith(POST_ID_LOOKUP_PREFIX)) {
+      const uri = key.slice(POST_ID_LOOKUP_PREFIX.length);
+      const idValue = Number(value);
+      if (uri && Number.isInteger(idValue) && idValue > 0) {
+        pendingIdByUri.set(uri, idValue);
+        seenPostIds.add(idValue);
+      } else {
+        await delKey(key);
+      }
+      continue;
+    }
 
     if (key.startsWith(POST_PREFIX)) {
       const uri = key.slice(POST_PREFIX.length);
@@ -477,47 +914,145 @@ async function loadState(): Promise<void> {
       const likes = Number(persisted.likes) || 0;
       const reposts = Number(persisted.reposts) || 0;
       const lastUpdated = Number(persisted.lastUpdated) || now;
+      const persistedId = typeof persisted.id === 'number' && Number.isInteger(persisted.id) && persisted.id > 0
+        ? persisted.id
+        : undefined;
 
       if (likes === 0 && reposts === 0) {
         await delKey(key);
+        if (persistedId !== undefined) {
+          await removePostId(uri, persistedId);
+        }
         continue;
       }
 
-      if (now - lastUpdated > staleIntervalMs) {
+      if (now - lastUpdated > maxPostAgeMs) {
         removedStale++;
         await delKey(key);
+        if (persistedId !== undefined) {
+          await removePostId(uri, persistedId);
+        }
         continue;
       }
 
-      postStats.set(uri, { likes, reposts, lastUpdated });
-      loadedPosts++;
-    } else if (key.startsWith(LIKE_PREFIX)) {
-      pendingLikes.push([key.slice(LIKE_PREFIX.length), value as string]);
-    } else if (key.startsWith(REPOST_PREFIX)) {
-      pendingReposts.push([key.slice(REPOST_PREFIX.length), value as string]);
+      restoredPosts.push({ uri, likes, reposts, lastUpdated, persistedId });
+      continue;
+    }
+
+    if (key.startsWith(LIKE_PREFIX)) {
+      pendingLikes.push([key.slice(LIKE_PREFIX.length), value as string | number]);
+      continue;
+    }
+
+    if (key.startsWith(REPOST_PREFIX)) {
+      pendingReposts.push([key.slice(REPOST_PREFIX.length), value as string | number]);
+      continue;
     }
   }
 
-  for (const [likeId, uri] of pendingLikes) {
-    if (uri && postStats.has(uri)) {
-      activeLikes.set(likeId, uri);
-    } else {
-      await delKey(likeKey(likeId));
+  for (const [uri, id] of pendingIdByUri) {
+    const options = pendingUrlById.has(id)
+      ? { persist: false as const, postUrl: pendingUrlById.get(id) ?? null }
+      : { persist: false as const };
+    rememberPostId(uri, id, options);
+  }
+
+  for (const [id, uri] of pendingUriById) {
+    if (!postIdByUri.has(uri)) {
+      const options = pendingUrlById.has(id)
+        ? { persist: false as const, postUrl: pendingUrlById.get(id) ?? null }
+        : { persist: false as const };
+      rememberPostId(uri, id, options);
     }
   }
 
-  for (const [repostId, uri] of pendingReposts) {
-    if (uri && postStats.has(uri)) {
-      activeReposts.set(repostId, uri);
-    } else {
-      await delKey(repostKey(repostId));
+  for (const [id, url] of pendingUrlById) {
+    if (!postUrlById.has(id)) {
+      const uri = uriByPostId.get(id);
+      if (uri) {
+        rememberPostId(uri, id, { persist: false, postUrl: url ?? null });
+      }
     }
+  }
+
+  const highestSeenPostId = seenPostIds.size > 0 ? Math.max(...seenPostIds) : 0;
+  if (storedNextPostId !== null) {
+    nextPostId = Math.max(storedNextPostId, highestSeenPostId + 1);
+  } else {
+    nextPostId = highestSeenPostId + 1;
+  }
+  if (nextPostId < 1) nextPostId = 1;
+
+  for (const restored of restoredPosts) {
+    let postId = postIdByUri.get(restored.uri);
+    if (postId === undefined && restored.persistedId !== undefined) {
+      postId = restored.persistedId;
+      const existingUrl = postUrlById.get(postId) ?? pendingUrlById.get(postId) ?? null;
+      rememberPostId(restored.uri, postId, { persist: false, postUrl: existingUrl });
+    }
+    if (postId === undefined) {
+      postId = allocatePostId(restored.uri);
+    }
+    const knownUrl = postUrlById.get(postId) ?? pendingUrlById.get(postId) ?? null;
+    rememberPostId(restored.uri, postId, { persist: false, postUrl: knownUrl });
+    const stats: PostStats = {
+      likes: restored.likes,
+      reposts: restored.reposts,
+      lastUpdated: restored.lastUpdated,
+      id: postId,
+    };
+    seenPostIds.add(postId);
+    postStats.set(restored.uri, stats);
+    void putKey(postKey(restored.uri), stats);
+    loadedPosts++;
+  }
+
+  void putKey(META_NEXT_POST_ID_KEY, nextPostId);
+
+  for (const [likeId, stored] of pendingLikes) {
+    let postId: number | undefined;
+    if (typeof stored === 'number') {
+      postId = stored;
+    } else if (typeof stored === 'string') {
+      postId = postIdByUri.get(stored);
+      if (postId !== undefined) {
+        void putKey(likeKey(likeId), postId);
+      }
+    }
+    if (postId !== undefined) {
+      const uri = uriByPostId.get(postId);
+      if (uri && postStats.has(uri)) {
+        activeLikes.set(likeId, postId);
+        continue;
+      }
+    }
+    await delKey(likeKey(likeId));
+  }
+
+  for (const [repostId, stored] of pendingReposts) {
+    let postId: number | undefined;
+    if (typeof stored === 'number') {
+      postId = stored;
+    } else if (typeof stored === 'string') {
+      postId = postIdByUri.get(stored);
+      if (postId !== undefined) {
+        void putKey(repostKey(repostId), postId);
+      }
+    }
+    if (postId !== undefined) {
+      const uri = uriByPostId.get(postId);
+      if (uri && postStats.has(uri)) {
+        activeReposts.set(repostId, postId);
+        continue;
+      }
+    }
+    await delKey(repostKey(repostId));
   }
 
   await pruneInactivePosts();
 
   console.log(
-    `${colors.gray}Recovered ${postStats.size} posts (${activeLikes.size} likes, ${activeReposts.size} reposts) from LevelDB` +
+    `${colors.gray}Recovered ${postStats.size} posts (${activeLikes.size()} likes, ${activeReposts.size()} reposts) from LevelDB` +
     (removedStale ? `, removed ${removedStale} stale entries` : '') +
     `${colors.reset}`
   );
@@ -530,9 +1065,13 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
 
   if (reportTimer) clearInterval(reportTimer);
   if (pruneTimer) clearInterval(pruneTimer);
+  if (snapshotTimer) clearInterval(snapshotTimer);
+
+  await snapshotQueue;
 
   reportTopPosts('Final report');
   await pruneInactivePosts();
+  await writeSnapshot('Final snapshot');
 
   try {
     await db.close();
@@ -548,6 +1087,7 @@ async function main(): Promise<void> {
   await db.open();
   await loadState();
   reportTopPosts('Initial status');
+  queueSnapshot('Initial snapshot');
   connect();
 }
 
