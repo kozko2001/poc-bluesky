@@ -151,6 +151,44 @@ class LruCache<K, V> {
   }
 }
 
+interface ProgressLogger {
+  tick(delta?: number): void;
+  done(extraMessage?: string): void;
+}
+
+function createProgressLogger(label: string, interval: number = 5_000): ProgressLogger {
+  let count = 0;
+  let lastLogged = 0;
+  const startTime = Date.now();
+
+  console.log(`${colors.dim}${label}…${colors.reset}`);
+
+  return {
+    tick(delta: number = 1) {
+      count += delta;
+      if (count - lastLogged < interval) {
+        return;
+      }
+      lastLogged = count;
+      const elapsedSeconds = (Date.now() - startTime) / 1000;
+      console.log(
+        `  ${colors.gray}${label}:${colors.reset} ${colors.white}${count.toLocaleString()}${colors.reset} processed (${elapsedSeconds.toFixed(1)}s)`
+      );
+    },
+    done(extraMessage?: string) {
+      const elapsedSeconds = (Date.now() - startTime) / 1000;
+      let message =
+        `${colors.green}${colors.bright}✓${colors.reset} ${label} — ` +
+        `${colors.white}${count.toLocaleString()}${colors.reset} processed in ` +
+        `${colors.white}${elapsedSeconds.toFixed(1)}s${colors.reset}`;
+      if (extraMessage) {
+        message += ` (${extraMessage})`;
+      }
+      console.log(`  ${message}`);
+    },
+  };
+}
+
 type LevelBatchOperation =
   | { type: 'put'; key: string; value: unknown }
   | { type: 'del'; key: string };
@@ -983,6 +1021,8 @@ async function loadState(): Promise<void> {
   uriByPostId.clear();
   postUrlById.clear();
 
+  console.log(`${colors.dim}Loading LevelDB state into memory…${colors.reset}`);
+
   let removedStale = 0;
   let highestSeenPostId = 0;
   const recoveryBatch = createKeyValueBatch(db, 5_000);
@@ -1008,8 +1048,10 @@ async function loadState(): Promise<void> {
 
     async function restorePostIdLookups(): Promise<number> {
       let maxId = 0;
+      const progress = createProgressLogger('Restoring post ID lookups');
       const upperBound = `${POST_ID_LOOKUP_PREFIX}\uffff`;
       for await (const [key, value] of db.iterator({ gte: POST_ID_LOOKUP_PREFIX, lt: upperBound })) {
+        progress.tick();
         const uri = key.slice(POST_ID_LOOKUP_PREFIX.length);
         const idValue = Number(value);
         if (uri && Number.isInteger(idValue) && idValue > 0) {
@@ -1019,13 +1061,17 @@ async function loadState(): Promise<void> {
           await delKey(key);
         }
       }
+      const extra = maxId > 0 ? `highest id ${maxId.toLocaleString()}` : undefined;
+      progress.done(extra);
       return maxId;
     }
 
     async function restorePostUriMappings(): Promise<number> {
       let maxId = 0;
+      const progress = createProgressLogger('Restoring post URI mappings');
       const upperBound = `${POST_URI_PREFIX}\uffff`;
       for await (const [key, value] of db.iterator({ gte: POST_URI_PREFIX, lt: upperBound })) {
+        progress.tick();
         const idValue = Number(key.slice(POST_URI_PREFIX.length));
         if (!Number.isInteger(idValue) || idValue <= 0) {
           await delKey(key);
@@ -1058,13 +1104,17 @@ async function loadState(): Promise<void> {
         }
         maxId = Math.max(maxId, idValue);
       }
+      const extra = maxId > 0 ? `highest id ${maxId.toLocaleString()}` : undefined;
+      progress.done(extra);
       return maxId;
     }
 
     async function restorePostUrls(): Promise<number> {
       let maxId = 0;
+      const progress = createProgressLogger('Restoring post URLs');
       const upperBound = `${POST_URL_PREFIX}\uffff`;
       for await (const [key, value] of db.iterator({ gte: POST_URL_PREFIX, lt: upperBound })) {
+        progress.tick();
         const idValue = Number(key.slice(POST_URL_PREFIX.length));
         if (!Number.isInteger(idValue) || idValue <= 0) {
           await delKey(key);
@@ -1082,6 +1132,8 @@ async function loadState(): Promise<void> {
         postUrlById.set(idValue, storedUrl === '' ? null : storedUrl);
         maxId = Math.max(maxId, idValue);
       }
+      const extra = maxId > 0 ? `highest id ${maxId.toLocaleString()}` : undefined;
+      progress.done(extra);
       return maxId;
     }
 
@@ -1089,8 +1141,10 @@ async function loadState(): Promise<void> {
       let restored = 0;
       let removed = 0;
       let highestId = 0;
+      const progress = createProgressLogger('Restoring post aggregates');
       const upperBound = `${POST_PREFIX}\uffff`;
       for await (const [key, value] of db.iterator({ gte: POST_PREFIX, lt: upperBound })) {
+        progress.tick();
         const uri = key.slice(POST_PREFIX.length);
         if (!uri) {
           await delKey(key);
@@ -1172,12 +1226,17 @@ async function loadState(): Promise<void> {
         }
         restored++;
       }
+      progress.done(`${restored.toLocaleString()} active, ${removed.toLocaleString()} stale removed`);
       return { loaded: restored, removed, highestId };
     }
 
     async function restoreLikes(): Promise<void> {
+      const progress = createProgressLogger('Restoring like associations');
+      let recovered = 0;
+      let purged = 0;
       const upperBound = `${LIKE_PREFIX}\uffff`;
       for await (const [key, value] of db.iterator({ gte: LIKE_PREFIX, lt: upperBound })) {
+        progress.tick();
         const likeId = key.slice(LIKE_PREFIX.length);
         let postId: number | undefined;
         if (typeof value === 'number') {
@@ -1193,16 +1252,23 @@ async function loadState(): Promise<void> {
           const uri = uriByPostId.get(postId);
           if (uri && postStats.has(uri)) {
             activeLikes.set(likeId, postId);
+            recovered++;
             continue;
           }
         }
         await delKey(key);
+        purged++;
       }
+      progress.done(`${recovered.toLocaleString()} active, ${purged.toLocaleString()} purged`);
     }
 
     async function restoreReposts(): Promise<void> {
+      const progress = createProgressLogger('Restoring repost associations');
+      let recovered = 0;
+      let purged = 0;
       const upperBound = `${REPOST_PREFIX}\uffff`;
       for await (const [key, value] of db.iterator({ gte: REPOST_PREFIX, lt: upperBound })) {
+        progress.tick();
         const repostId = key.slice(REPOST_PREFIX.length);
         let postId: number | undefined;
         if (typeof value === 'number') {
@@ -1218,11 +1284,14 @@ async function loadState(): Promise<void> {
           const uri = uriByPostId.get(postId);
           if (uri && postStats.has(uri)) {
             activeReposts.set(repostId, postId);
+            recovered++;
             continue;
           }
         }
         await delKey(key);
+        purged++;
       }
+      progress.done(`${recovered.toLocaleString()} active, ${purged.toLocaleString()} purged`);
     }
 
     const storedNextPostId = await loadStoredNextPostId();
