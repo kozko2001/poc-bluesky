@@ -18,7 +18,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: aggregator
-          image: harbor.allocsoc.net/bluesky/poc:486dfb005930be742ff051f1ce71ccc869702441
+          image: harbor.allocsoc.net/bluesky/poc:d3a9acb78597a640319227905bcceef8c0f35dc0
           imagePullPolicy: IfNotPresent
           env:
             - name: NODE_ENV
