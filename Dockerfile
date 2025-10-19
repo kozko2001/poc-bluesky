@@ -30,4 +30,4 @@ VOLUME ["/data"]
 
 USER node
 
-CMD ["node", "dist/aggregator.js", "--state", "/data/aggregator-db"]
+CMD ["node", "dist/aggregator.js", "--state", "/data/aggregator-db", "--top", "30"]
