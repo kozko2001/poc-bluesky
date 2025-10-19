@@ -827,32 +827,59 @@ function connect(): void {
 
 async function loadState(): Promise<void> {
   const now = Date.now();
-  let loadedPosts = 0;
+  postStats.clear();
+  activeLikes.clear();
+  activeReposts.clear();
+  postIdByUri.clear();
+  uriByPostId.clear();
+  postUrlById.clear();
+
   let removedStale = 0;
-  const pendingLikes: Array<[string, string | number]> = [];
-  const pendingReposts: Array<[string, string | number]> = [];
-  const restoredPosts: Array<{ uri: string; likes: number; reposts: number; lastUpdated: number; persistedId?: number }> = [];
-  const pendingIdByUri = new Map<string, number>();
-  const pendingUriById = new Map<number, string>();
-  const pendingUrlById = new Map<number, string | null>();
-  const seenPostIds = new Set<number>();
-  let storedNextPostId: number | null = null;
+  let loadedPosts = 0;
+  let highestSeenPostId = 0;
 
-  for await (const [key, value] of db.iterator()) {
-    if (typeof key !== 'string') continue;
-
-    if (key === META_NEXT_POST_ID_KEY) {
-      const numeric = Number(value);
+  async function loadStoredNextPostId(): Promise<number | null> {
+    try {
+      const stored = await db.get(META_NEXT_POST_ID_KEY);
+      const numeric = Number(stored);
       if (!Number.isNaN(numeric) && numeric > 0) {
-        storedNextPostId = Math.max(storedNextPostId ?? 0, Math.floor(numeric));
+        return Math.floor(numeric);
+      }
+      await delKey(META_NEXT_POST_ID_KEY);
+    } catch (error) {
+      if (!isNotFoundError(error)) {
+        console.error(`${colors.red}Failed to load ${META_NEXT_POST_ID_KEY}:${colors.reset}`, error);
+      }
+    }
+    return null;
+  }
+
+  async function restorePostIdLookups(): Promise<number> {
+    let maxId = 0;
+    const upperBound = `${POST_ID_LOOKUP_PREFIX}\uffff`;
+    for await (const [key, value] of db.iterator({ gte: POST_ID_LOOKUP_PREFIX, lt: upperBound })) {
+      const uri = key.slice(POST_ID_LOOKUP_PREFIX.length);
+      const idValue = Number(value);
+      if (uri && Number.isInteger(idValue) && idValue > 0) {
+        postIdByUri.set(uri, idValue);
+        maxId = Math.max(maxId, idValue);
       } else {
         await delKey(key);
       }
-      continue;
     }
+    return maxId;
+  }
 
-    if (key.startsWith(POST_URI_PREFIX)) {
+  async function restorePostUriMappings(): Promise<number> {
+    let maxId = 0;
+    const upperBound = `${POST_URI_PREFIX}\uffff`;
+    for await (const [key, value] of db.iterator({ gte: POST_URI_PREFIX, lt: upperBound })) {
       const idValue = Number(key.slice(POST_URI_PREFIX.length));
+      if (!Number.isInteger(idValue) || idValue <= 0) {
+        await delKey(key);
+        continue;
+      }
+
       const metaValue = value as unknown;
       let uri: string | undefined;
       let url: string | null | undefined;
@@ -864,53 +891,65 @@ async function loadState(): Promise<void> {
         if (typeof meta.url === 'string') url = meta.url;
         if (meta.url === null) url = null;
       }
-      if (uri && Number.isInteger(idValue) && idValue > 0) {
-        pendingUriById.set(idValue, uri);
-        if (url !== undefined) pendingUrlById.set(idValue, url);
-        seenPostIds.add(idValue);
-      } else {
-        await delKey(key);
-      }
-      continue;
-    }
 
-    if (key.startsWith(POST_URL_PREFIX)) {
+      if (!uri) {
+        await delKey(key);
+        continue;
+      }
+
+      uriByPostId.set(idValue, uri);
+      if (!postIdByUri.has(uri)) {
+        postIdByUri.set(uri, idValue);
+      }
+      if (url !== undefined) {
+        postUrlById.set(idValue, url);
+      }
+      maxId = Math.max(maxId, idValue);
+    }
+    return maxId;
+  }
+
+  async function restorePostUrls(): Promise<number> {
+    let maxId = 0;
+    const upperBound = `${POST_URL_PREFIX}\uffff`;
+    for await (const [key, value] of db.iterator({ gte: POST_URL_PREFIX, lt: upperBound })) {
       const idValue = Number(key.slice(POST_URL_PREFIX.length));
-      if (Number.isInteger(idValue) && idValue > 0) {
-        const storedUrl = typeof value === 'string'
-          ? value
-          : value === null
-            ? null
-            : undefined;
-        if (storedUrl !== undefined) {
-          pendingUrlById.set(idValue, storedUrl === '' ? null : storedUrl);
-          seenPostIds.add(idValue);
-        }
-      } else {
+      if (!Number.isInteger(idValue) || idValue <= 0) {
         await delKey(key);
+        continue;
       }
-      continue;
-    }
-
-    if (key.startsWith(POST_ID_LOOKUP_PREFIX)) {
-      const uri = key.slice(POST_ID_LOOKUP_PREFIX.length);
-      const idValue = Number(value);
-      if (uri && Number.isInteger(idValue) && idValue > 0) {
-        pendingIdByUri.set(uri, idValue);
-        seenPostIds.add(idValue);
-      } else {
+      const storedUrl = typeof value === 'string'
+        ? value
+        : value === null
+          ? null
+          : undefined;
+      if (storedUrl === undefined) {
         await delKey(key);
+        continue;
       }
-      continue;
+      postUrlById.set(idValue, storedUrl === '' ? null : storedUrl);
+      maxId = Math.max(maxId, idValue);
     }
+    return maxId;
+  }
 
-    if (key.startsWith(POST_PREFIX)) {
+  async function restorePosts(): Promise<{ loaded: number; removed: number; highestId: number }> {
+    let restored = 0;
+    let removed = 0;
+    let highestId = 0;
+    const upperBound = `${POST_PREFIX}\uffff`;
+    for await (const [key, value] of db.iterator({ gte: POST_PREFIX, lt: upperBound })) {
       const uri = key.slice(POST_PREFIX.length);
+      if (!uri) {
+        await delKey(key);
+        continue;
+      }
       const persisted = value as PersistedPostStats | undefined;
       if (!persisted) {
         await delKey(key);
         continue;
       }
+
       const likes = Number(persisted.likes) || 0;
       const reposts = Number(persisted.reposts) || 0;
       const lastUpdated = Number(persisted.lastUpdated) || now;
@@ -920,134 +959,120 @@ async function loadState(): Promise<void> {
 
       if (likes === 0 && reposts === 0) {
         await delKey(key);
-        if (persistedId !== undefined) {
-          await removePostId(uri, persistedId);
+        const knownId = persistedId ?? postIdByUri.get(uri);
+        if (knownId !== undefined) {
+          await removePostId(uri, knownId);
         }
         continue;
       }
 
       if (now - lastUpdated > maxPostAgeMs) {
-        removedStale++;
+        removed++;
         await delKey(key);
-        if (persistedId !== undefined) {
-          await removePostId(uri, persistedId);
+        const knownId = persistedId ?? postIdByUri.get(uri);
+        if (knownId !== undefined) {
+          await removePostId(uri, knownId);
         }
         continue;
       }
 
-      restoredPosts.push({ uri, likes, reposts, lastUpdated, persistedId });
-      continue;
-    }
-
-    if (key.startsWith(LIKE_PREFIX)) {
-      pendingLikes.push([key.slice(LIKE_PREFIX.length), value as string | number]);
-      continue;
-    }
-
-    if (key.startsWith(REPOST_PREFIX)) {
-      pendingReposts.push([key.slice(REPOST_PREFIX.length), value as string | number]);
-      continue;
-    }
-  }
-
-  for (const [uri, id] of pendingIdByUri) {
-    const options = pendingUrlById.has(id)
-      ? { persist: false as const, postUrl: pendingUrlById.get(id) ?? null }
-      : { persist: false as const };
-    rememberPostId(uri, id, options);
-  }
-
-  for (const [id, uri] of pendingUriById) {
-    if (!postIdByUri.has(uri)) {
-      const options = pendingUrlById.has(id)
-        ? { persist: false as const, postUrl: pendingUrlById.get(id) ?? null }
-        : { persist: false as const };
-      rememberPostId(uri, id, options);
-    }
-  }
-
-  for (const [id, url] of pendingUrlById) {
-    if (!postUrlById.has(id)) {
-      const uri = uriByPostId.get(id);
-      if (uri) {
-        rememberPostId(uri, id, { persist: false, postUrl: url ?? null });
+      let postId = postIdByUri.get(uri);
+      if (postId === undefined && persistedId !== undefined) {
+        postId = persistedId;
+        postIdByUri.set(uri, postId);
+        uriByPostId.set(postId, uri);
       }
+      if (postId === undefined) {
+        postId = allocatePostId(uri);
+      } else {
+        uriByPostId.set(postId, uri);
+        if (!postUrlById.has(postId)) {
+          const resolvedUrl = toPostUrl(uri);
+          postUrlById.set(postId, resolvedUrl ?? null);
+        }
+      }
+
+      const stats: PostStats = {
+        likes,
+        reposts,
+        lastUpdated,
+        id: postId,
+      };
+      postStats.set(uri, stats);
+      highestId = Math.max(highestId, postId);
+      void putKey(postKey(uri), stats);
+      restored++;
+    }
+    return { loaded: restored, removed, highestId };
+  }
+
+  async function restoreLikes(): Promise<void> {
+    const upperBound = `${LIKE_PREFIX}\uffff`;
+    for await (const [key, value] of db.iterator({ gte: LIKE_PREFIX, lt: upperBound })) {
+      const likeId = key.slice(LIKE_PREFIX.length);
+      let postId: number | undefined;
+      if (typeof value === 'number') {
+        postId = value;
+      } else if (typeof value === 'string') {
+        postId = postIdByUri.get(value);
+        if (postId !== undefined) {
+          void putKey(likeKey(likeId), postId);
+        }
+      }
+
+      if (postId !== undefined) {
+        const uri = uriByPostId.get(postId);
+        if (uri && postStats.has(uri)) {
+          activeLikes.set(likeId, postId);
+          continue;
+        }
+      }
+      await delKey(key);
     }
   }
 
-  const highestSeenPostId = seenPostIds.size > 0 ? Math.max(...seenPostIds) : 0;
-  if (storedNextPostId !== null) {
-    nextPostId = Math.max(storedNextPostId, highestSeenPostId + 1);
-  } else {
-    nextPostId = highestSeenPostId + 1;
-  }
-  if (nextPostId < 1) nextPostId = 1;
+  async function restoreReposts(): Promise<void> {
+    const upperBound = `${REPOST_PREFIX}\uffff`;
+    for await (const [key, value] of db.iterator({ gte: REPOST_PREFIX, lt: upperBound })) {
+      const repostId = key.slice(REPOST_PREFIX.length);
+      let postId: number | undefined;
+      if (typeof value === 'number') {
+        postId = value;
+      } else if (typeof value === 'string') {
+        postId = postIdByUri.get(value);
+        if (postId !== undefined) {
+          void putKey(repostKey(repostId), postId);
+        }
+      }
 
-  for (const restored of restoredPosts) {
-    let postId = postIdByUri.get(restored.uri);
-    if (postId === undefined && restored.persistedId !== undefined) {
-      postId = restored.persistedId;
-      const existingUrl = postUrlById.get(postId) ?? pendingUrlById.get(postId) ?? null;
-      rememberPostId(restored.uri, postId, { persist: false, postUrl: existingUrl });
+      if (postId !== undefined) {
+        const uri = uriByPostId.get(postId);
+        if (uri && postStats.has(uri)) {
+          activeReposts.set(repostId, postId);
+          continue;
+        }
+      }
+      await delKey(key);
     }
-    if (postId === undefined) {
-      postId = allocatePostId(restored.uri);
-    }
-    const knownUrl = postUrlById.get(postId) ?? pendingUrlById.get(postId) ?? null;
-    rememberPostId(restored.uri, postId, { persist: false, postUrl: knownUrl });
-    const stats: PostStats = {
-      likes: restored.likes,
-      reposts: restored.reposts,
-      lastUpdated: restored.lastUpdated,
-      id: postId,
-    };
-    seenPostIds.add(postId);
-    postStats.set(restored.uri, stats);
-    void putKey(postKey(restored.uri), stats);
-    loadedPosts++;
   }
+
+  const storedNextPostId = await loadStoredNextPostId();
+  highestSeenPostId = Math.max(highestSeenPostId, await restorePostIdLookups());
+  highestSeenPostId = Math.max(highestSeenPostId, await restorePostUriMappings());
+  highestSeenPostId = Math.max(highestSeenPostId, await restorePostUrls());
+
+  nextPostId = Math.max(storedNextPostId ?? 0, highestSeenPostId + 1, 1);
+
+  const postResult = await restorePosts();
+  loadedPosts = postResult.loaded;
+  removedStale += postResult.removed;
+  highestSeenPostId = Math.max(highestSeenPostId, postResult.highestId);
+  nextPostId = Math.max(nextPostId, highestSeenPostId + 1);
 
   void putKey(META_NEXT_POST_ID_KEY, nextPostId);
 
-  for (const [likeId, stored] of pendingLikes) {
-    let postId: number | undefined;
-    if (typeof stored === 'number') {
-      postId = stored;
-    } else if (typeof stored === 'string') {
-      postId = postIdByUri.get(stored);
-      if (postId !== undefined) {
-        void putKey(likeKey(likeId), postId);
-      }
-    }
-    if (postId !== undefined) {
-      const uri = uriByPostId.get(postId);
-      if (uri && postStats.has(uri)) {
-        activeLikes.set(likeId, postId);
-        continue;
-      }
-    }
-    await delKey(likeKey(likeId));
-  }
-
-  for (const [repostId, stored] of pendingReposts) {
-    let postId: number | undefined;
-    if (typeof stored === 'number') {
-      postId = stored;
-    } else if (typeof stored === 'string') {
-      postId = postIdByUri.get(stored);
-      if (postId !== undefined) {
-        void putKey(repostKey(repostId), postId);
-      }
-    }
-    if (postId !== undefined) {
-      const uri = uriByPostId.get(postId);
-      if (uri && postStats.has(uri)) {
-        activeReposts.set(repostId, postId);
-        continue;
-      }
-    }
-    await delKey(repostKey(repostId));
-  }
+  await restoreLikes();
+  await restoreReposts();
 
   await pruneInactivePosts();
 
