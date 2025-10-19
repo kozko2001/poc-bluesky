@@ -30,6 +30,7 @@ const DEFAULT_DB_PATH = './data/aggregator-db';
 const DEFAULT_SNAPSHOT_DIR = './data/aggregator-snapshots';
 const DEFAULT_MAX_ACTIVE_LIKES = 200_000;
 const DEFAULT_MAX_ACTIVE_REPOSTS = 120_000;
+const DEFAULT_COMPACTION_DELAY_MS = 3 * 60 * 1000;
 const REPOST_WEIGHT = 2;
 
 const META_NEXT_POST_ID_KEY = 'meta:nextPostId';
@@ -147,6 +148,77 @@ class LruCache<K, V> {
 
   [Symbol.iterator](): IterableIterator<[K, V]> {
     return this.store[Symbol.iterator]();
+  }
+}
+
+type LevelBatchOperation =
+  | { type: 'put'; key: string; value: unknown }
+  | { type: 'del'; key: string };
+
+interface KeyValueBatch {
+  put(key: string, value: unknown): void;
+  del(key: string): void;
+  flush(): Promise<void>;
+}
+
+function createKeyValueBatch(
+  targetDb: Level<string, unknown>,
+  maxOps: number = 1_000
+): KeyValueBatch {
+  let pending: Promise<void> | null = null;
+  let operations: LevelBatchOperation[] = [];
+
+  const applyBatch = async (ops: LevelBatchOperation[]): Promise<void> => {
+    if (ops.length === 0) return;
+    try {
+      await targetDb.batch(ops);
+    } catch (error) {
+      console.error(`${colors.red}Failed to apply LevelDB batch:${colors.reset}`, error);
+    }
+  };
+
+  const scheduleFlush = (): void => {
+    if (operations.length < maxOps || pending) {
+      return;
+    }
+    const batch = operations;
+    operations = [];
+    pending = applyBatch(batch).finally(() => {
+      pending = null;
+      if (operations.length >= maxOps) {
+        scheduleFlush();
+      }
+    });
+  };
+
+  return {
+    put(key: string, value: unknown) {
+      operations.push({ type: 'put', key, value });
+      scheduleFlush();
+    },
+    del(key: string) {
+      operations.push({ type: 'del', key });
+      scheduleFlush();
+    },
+    async flush() {
+      if (pending) {
+        await pending;
+      }
+      const batch = operations;
+      operations = [];
+      await applyBatch(batch);
+    },
+  };
+}
+
+async function withWriteBatch<T>(batch: KeyValueBatch, fn: () => Promise<T>): Promise<T> {
+  const previousBatch = activeWriteBatch;
+  activeWriteBatch = batch;
+  try {
+    return await fn();
+  } finally {
+    await batch.flush();
+    activeWriteBatch = previousBatch;
   }
 }
 
@@ -288,6 +360,10 @@ let shuttingDown = false;
 let db: Level<string, unknown>;
 let snapshotQueue: Promise<void> = Promise.resolve();
 let nextPostId = 1;
+let activeWriteBatch: KeyValueBatch | null = null;
+let startupMaintenanceTimer: NodeJS.Timeout | null = null;
+let compactionTimer: NodeJS.Timeout | null = null;
+let compactionInProgress = false;
 
 function calculateScore(stats: PostStats): number {
   return stats.likes + REPOST_WEIGHT * stats.reposts;
@@ -457,6 +533,12 @@ async function purgePersistedAssociationsByPostId(
 }
 
 async function putKey(key: string, value: unknown): Promise<void> {
+  const batch = activeWriteBatch;
+  if (batch) {
+    batch.put(key, value);
+    return;
+  }
+
   try {
     await db.put(key, value);
   } catch (error) {
@@ -465,6 +547,12 @@ async function putKey(key: string, value: unknown): Promise<void> {
 }
 
 async function delKey(key: string): Promise<void> {
+  const batch = activeWriteBatch;
+  if (batch) {
+    batch.del(key);
+    return;
+  }
+
   try {
     await db.del(key);
   } catch (error) {
@@ -514,35 +602,46 @@ async function cleanupActiveMaps(removedPostIds: number[]): Promise<void> {
 }
 
 async function pruneInactivePosts(): Promise<void> {
-  const removedIds: number[] = [];
-  const now = Date.now();
+  const performPrune = async (): Promise<number> => {
+    const removedIds: number[] = [];
+    const now = Date.now();
 
-  for (const [uri, stats] of postStats) {
-    if (now - stats.lastUpdated > maxPostAgeMs) {
-      postStats.delete(uri);
-      removedIds.push(stats.id);
-      await delKey(postKey(uri));
-      await removePostId(uri, stats.id);
-    }
-  }
-
-  if (postStats.size > maxTrackedPosts) {
-    const excess = postStats.size - maxTrackedPosts;
-    const entries = Array.from(postStats.entries()).sort(
-      (a, b) => a[1].lastUpdated - b[1].lastUpdated
-    );
-    for (let i = 0; i < excess; i++) {
-      const [uri] = entries[i];
-      const stats = postStats.get(uri);
-      if (stats && postStats.delete(uri)) {
+    for (const [uri, stats] of postStats) {
+      if (now - stats.lastUpdated > maxPostAgeMs) {
+        postStats.delete(uri);
         removedIds.push(stats.id);
         await delKey(postKey(uri));
         await removePostId(uri, stats.id);
       }
     }
-  }
 
-  await cleanupActiveMaps(removedIds);
+    if (postStats.size > maxTrackedPosts) {
+      const excess = postStats.size - maxTrackedPosts;
+      const entries = Array.from(postStats.entries()).sort(
+        (a, b) => a[1].lastUpdated - b[1].lastUpdated
+      );
+      for (let i = 0; i < excess; i++) {
+        const [uri] = entries[i];
+        const stats = postStats.get(uri);
+        if (stats && postStats.delete(uri)) {
+          removedIds.push(stats.id);
+          await delKey(postKey(uri));
+          await removePostId(uri, stats.id);
+        }
+      }
+    }
+
+    await cleanupActiveMaps(removedIds);
+    return removedIds.length;
+  };
+
+  const removedCount = activeWriteBatch
+    ? await performPrune()
+    : await withWriteBatch(createKeyValueBatch(db, 2_000), performPrune);
+
+  if (removedCount > 0) {
+    scheduleCompaction();
+  }
 }
 
 function schedulePruning(): void {
@@ -716,6 +815,57 @@ function scheduleSnapshots(): void {
   }, snapshotIntervalMs);
 }
 
+function scheduleCompaction(delayMs: number = DEFAULT_COMPACTION_DELAY_MS): void {
+  if (!db) return;
+  const compactable = db as Level<string, unknown> & {
+    compactRange?: (start?: string, end?: string) => Promise<void>;
+  };
+  if (typeof compactable.compactRange !== 'function') {
+    return;
+  }
+  if (compactionTimer || compactionInProgress) {
+    return;
+  }
+
+  compactionTimer = setTimeout(() => {
+    compactionTimer = null;
+    if (!db) return;
+    const target = db as Level<string, unknown> & {
+      compactRange?: (start?: string, end?: string) => Promise<void>;
+    };
+    if (typeof target.compactRange !== 'function') {
+      return;
+    }
+
+    compactionInProgress = true;
+    const startedAt = Date.now();
+    void target
+      .compactRange(undefined, undefined)
+      .then(() => {
+        const elapsedSeconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+        console.log(
+          `${formatTimestamp()} ${colors.dim}LevelDB compaction completed in ${elapsedSeconds}s${colors.reset}`
+        );
+      })
+      .catch((error) => {
+        console.error(`${colors.red}LevelDB compaction failed:${colors.reset}`, error);
+      })
+      .finally(() => {
+        compactionInProgress = false;
+      });
+  }, Math.max(1, delayMs));
+}
+
+function scheduleStartupMaintenance(delayMs: number = 10_000): void {
+  if (startupMaintenanceTimer) return;
+  startupMaintenanceTimer = setTimeout(() => {
+    startupMaintenanceTimer = null;
+    void pruneInactivePosts().catch((error) => {
+      console.error(`${colors.red}Startup prune failed:${colors.reset}`, error);
+    });
+  }, Math.max(0, delayMs));
+}
+
 async function handleLike(event: JetstreamEvent, commit: JetstreamCommit): Promise<void> {
   const key = `${event.did}/${commit.rkey}`;
   const storageKey = likeKey(key);
@@ -826,7 +976,6 @@ function connect(): void {
 }
 
 async function loadState(): Promise<void> {
-  const now = Date.now();
   postStats.clear();
   activeLikes.clear();
   activeReposts.clear();
@@ -835,246 +984,268 @@ async function loadState(): Promise<void> {
   postUrlById.clear();
 
   let removedStale = 0;
-  let loadedPosts = 0;
   let highestSeenPostId = 0;
+  const recoveryBatch = createKeyValueBatch(db, 5_000);
 
-  async function loadStoredNextPostId(): Promise<number | null> {
-    try {
-      const stored = await db.get(META_NEXT_POST_ID_KEY);
-      const numeric = Number(stored);
-      if (!Number.isNaN(numeric) && numeric > 0) {
-        return Math.floor(numeric);
+  await withWriteBatch(recoveryBatch, async () => {
+    const now = Date.now();
+
+    async function loadStoredNextPostId(): Promise<number | null> {
+      try {
+        const stored = await db.get(META_NEXT_POST_ID_KEY);
+        const numeric = Number(stored);
+        if (!Number.isNaN(numeric) && numeric > 0) {
+          return Math.floor(numeric);
+        }
+        await delKey(META_NEXT_POST_ID_KEY);
+      } catch (error) {
+        if (!isNotFoundError(error)) {
+          console.error(`${colors.red}Failed to load ${META_NEXT_POST_ID_KEY}:${colors.reset}`, error);
+        }
       }
-      await delKey(META_NEXT_POST_ID_KEY);
-    } catch (error) {
-      if (!isNotFoundError(error)) {
-        console.error(`${colors.red}Failed to load ${META_NEXT_POST_ID_KEY}:${colors.reset}`, error);
-      }
+      return null;
     }
-    return null;
-  }
 
-  async function restorePostIdLookups(): Promise<number> {
-    let maxId = 0;
-    const upperBound = `${POST_ID_LOOKUP_PREFIX}\uffff`;
-    for await (const [key, value] of db.iterator({ gte: POST_ID_LOOKUP_PREFIX, lt: upperBound })) {
-      const uri = key.slice(POST_ID_LOOKUP_PREFIX.length);
-      const idValue = Number(value);
-      if (uri && Number.isInteger(idValue) && idValue > 0) {
-        postIdByUri.set(uri, idValue);
+    async function restorePostIdLookups(): Promise<number> {
+      let maxId = 0;
+      const upperBound = `${POST_ID_LOOKUP_PREFIX}\uffff`;
+      for await (const [key, value] of db.iterator({ gte: POST_ID_LOOKUP_PREFIX, lt: upperBound })) {
+        const uri = key.slice(POST_ID_LOOKUP_PREFIX.length);
+        const idValue = Number(value);
+        if (uri && Number.isInteger(idValue) && idValue > 0) {
+          postIdByUri.set(uri, idValue);
+          maxId = Math.max(maxId, idValue);
+        } else {
+          await delKey(key);
+        }
+      }
+      return maxId;
+    }
+
+    async function restorePostUriMappings(): Promise<number> {
+      let maxId = 0;
+      const upperBound = `${POST_URI_PREFIX}\uffff`;
+      for await (const [key, value] of db.iterator({ gte: POST_URI_PREFIX, lt: upperBound })) {
+        const idValue = Number(key.slice(POST_URI_PREFIX.length));
+        if (!Number.isInteger(idValue) || idValue <= 0) {
+          await delKey(key);
+          continue;
+        }
+
+        const metaValue = value as unknown;
+        let uri: string | undefined;
+        let url: string | null | undefined;
+        if (typeof metaValue === 'string') {
+          uri = metaValue;
+        } else if (metaValue && typeof metaValue === 'object') {
+          const meta = metaValue as { uri?: unknown; url?: unknown };
+          if (typeof meta.uri === 'string') uri = meta.uri;
+          if (typeof meta.url === 'string') url = meta.url;
+          if (meta.url === null) url = null;
+        }
+
+        if (!uri) {
+          await delKey(key);
+          continue;
+        }
+
+        uriByPostId.set(idValue, uri);
+        if (!postIdByUri.has(uri)) {
+          postIdByUri.set(uri, idValue);
+        }
+        if (url !== undefined) {
+          postUrlById.set(idValue, url);
+        }
         maxId = Math.max(maxId, idValue);
-      } else {
-        await delKey(key);
       }
+      return maxId;
     }
-    return maxId;
-  }
 
-  async function restorePostUriMappings(): Promise<number> {
-    let maxId = 0;
-    const upperBound = `${POST_URI_PREFIX}\uffff`;
-    for await (const [key, value] of db.iterator({ gte: POST_URI_PREFIX, lt: upperBound })) {
-      const idValue = Number(key.slice(POST_URI_PREFIX.length));
-      if (!Number.isInteger(idValue) || idValue <= 0) {
-        await delKey(key);
-        continue;
+    async function restorePostUrls(): Promise<number> {
+      let maxId = 0;
+      const upperBound = `${POST_URL_PREFIX}\uffff`;
+      for await (const [key, value] of db.iterator({ gte: POST_URL_PREFIX, lt: upperBound })) {
+        const idValue = Number(key.slice(POST_URL_PREFIX.length));
+        if (!Number.isInteger(idValue) || idValue <= 0) {
+          await delKey(key);
+          continue;
+        }
+        const storedUrl = typeof value === 'string'
+          ? value
+          : value === null
+            ? null
+            : undefined;
+        if (storedUrl === undefined) {
+          await delKey(key);
+          continue;
+        }
+        postUrlById.set(idValue, storedUrl === '' ? null : storedUrl);
+        maxId = Math.max(maxId, idValue);
       }
-
-      const metaValue = value as unknown;
-      let uri: string | undefined;
-      let url: string | null | undefined;
-      if (typeof metaValue === 'string') {
-        uri = metaValue;
-      } else if (metaValue && typeof metaValue === 'object') {
-        const meta = metaValue as { uri?: unknown; url?: unknown };
-        if (typeof meta.uri === 'string') uri = meta.uri;
-        if (typeof meta.url === 'string') url = meta.url;
-        if (meta.url === null) url = null;
-      }
-
-      if (!uri) {
-        await delKey(key);
-        continue;
-      }
-
-      uriByPostId.set(idValue, uri);
-      if (!postIdByUri.has(uri)) {
-        postIdByUri.set(uri, idValue);
-      }
-      if (url !== undefined) {
-        postUrlById.set(idValue, url);
-      }
-      maxId = Math.max(maxId, idValue);
+      return maxId;
     }
-    return maxId;
-  }
 
-  async function restorePostUrls(): Promise<number> {
-    let maxId = 0;
-    const upperBound = `${POST_URL_PREFIX}\uffff`;
-    for await (const [key, value] of db.iterator({ gte: POST_URL_PREFIX, lt: upperBound })) {
-      const idValue = Number(key.slice(POST_URL_PREFIX.length));
-      if (!Number.isInteger(idValue) || idValue <= 0) {
-        await delKey(key);
-        continue;
-      }
-      const storedUrl = typeof value === 'string'
-        ? value
-        : value === null
-          ? null
+    async function restorePosts(): Promise<{ loaded: number; removed: number; highestId: number }> {
+      let restored = 0;
+      let removed = 0;
+      let highestId = 0;
+      const upperBound = `${POST_PREFIX}\uffff`;
+      for await (const [key, value] of db.iterator({ gte: POST_PREFIX, lt: upperBound })) {
+        const uri = key.slice(POST_PREFIX.length);
+        if (!uri) {
+          await delKey(key);
+          continue;
+        }
+        const persisted = value as PersistedPostStats | undefined;
+        if (!persisted) {
+          await delKey(key);
+          continue;
+        }
+
+        const likes = Number(persisted.likes) || 0;
+        const reposts = Number(persisted.reposts) || 0;
+        const lastUpdated = Number(persisted.lastUpdated) || now;
+        const persistedId = typeof persisted.id === 'number' && Number.isInteger(persisted.id) && persisted.id > 0
+          ? persisted.id
           : undefined;
-      if (storedUrl === undefined) {
-        await delKey(key);
-        continue;
-      }
-      postUrlById.set(idValue, storedUrl === '' ? null : storedUrl);
-      maxId = Math.max(maxId, idValue);
-    }
-    return maxId;
-  }
 
-  async function restorePosts(): Promise<{ loaded: number; removed: number; highestId: number }> {
-    let restored = 0;
-    let removed = 0;
-    let highestId = 0;
-    const upperBound = `${POST_PREFIX}\uffff`;
-    for await (const [key, value] of db.iterator({ gte: POST_PREFIX, lt: upperBound })) {
-      const uri = key.slice(POST_PREFIX.length);
-      if (!uri) {
-        await delKey(key);
-        continue;
-      }
-      const persisted = value as PersistedPostStats | undefined;
-      if (!persisted) {
-        await delKey(key);
-        continue;
-      }
-
-      const likes = Number(persisted.likes) || 0;
-      const reposts = Number(persisted.reposts) || 0;
-      const lastUpdated = Number(persisted.lastUpdated) || now;
-      const persistedId = typeof persisted.id === 'number' && Number.isInteger(persisted.id) && persisted.id > 0
-        ? persisted.id
-        : undefined;
-
-      if (likes === 0 && reposts === 0) {
-        await delKey(key);
-        const knownId = persistedId ?? postIdByUri.get(uri);
-        if (knownId !== undefined) {
-          await removePostId(uri, knownId);
-        }
-        continue;
-      }
-
-      if (now - lastUpdated > maxPostAgeMs) {
-        removed++;
-        await delKey(key);
-        const knownId = persistedId ?? postIdByUri.get(uri);
-        if (knownId !== undefined) {
-          await removePostId(uri, knownId);
-        }
-        continue;
-      }
-
-      let postId = postIdByUri.get(uri);
-      if (postId === undefined && persistedId !== undefined) {
-        postId = persistedId;
-        postIdByUri.set(uri, postId);
-        uriByPostId.set(postId, uri);
-      }
-      if (postId === undefined) {
-        postId = allocatePostId(uri);
-      } else {
-        uriByPostId.set(postId, uri);
-        if (!postUrlById.has(postId)) {
-          const resolvedUrl = toPostUrl(uri);
-          postUrlById.set(postId, resolvedUrl ?? null);
-        }
-      }
-
-      const stats: PostStats = {
-        likes,
-        reposts,
-        lastUpdated,
-        id: postId,
-      };
-      postStats.set(uri, stats);
-      highestId = Math.max(highestId, postId);
-      void putKey(postKey(uri), stats);
-      restored++;
-    }
-    return { loaded: restored, removed, highestId };
-  }
-
-  async function restoreLikes(): Promise<void> {
-    const upperBound = `${LIKE_PREFIX}\uffff`;
-    for await (const [key, value] of db.iterator({ gte: LIKE_PREFIX, lt: upperBound })) {
-      const likeId = key.slice(LIKE_PREFIX.length);
-      let postId: number | undefined;
-      if (typeof value === 'number') {
-        postId = value;
-      } else if (typeof value === 'string') {
-        postId = postIdByUri.get(value);
-        if (postId !== undefined) {
-          void putKey(likeKey(likeId), postId);
-        }
-      }
-
-      if (postId !== undefined) {
-        const uri = uriByPostId.get(postId);
-        if (uri && postStats.has(uri)) {
-          activeLikes.set(likeId, postId);
+        if (likes === 0 && reposts === 0) {
+          await delKey(key);
+          const knownId = persistedId ?? postIdByUri.get(uri);
+          if (knownId !== undefined) {
+            await removePostId(uri, knownId);
+          }
           continue;
         }
-      }
-      await delKey(key);
-    }
-  }
 
-  async function restoreReposts(): Promise<void> {
-    const upperBound = `${REPOST_PREFIX}\uffff`;
-    for await (const [key, value] of db.iterator({ gte: REPOST_PREFIX, lt: upperBound })) {
-      const repostId = key.slice(REPOST_PREFIX.length);
-      let postId: number | undefined;
-      if (typeof value === 'number') {
-        postId = value;
-      } else if (typeof value === 'string') {
-        postId = postIdByUri.get(value);
-        if (postId !== undefined) {
-          void putKey(repostKey(repostId), postId);
-        }
-      }
-
-      if (postId !== undefined) {
-        const uri = uriByPostId.get(postId);
-        if (uri && postStats.has(uri)) {
-          activeReposts.set(repostId, postId);
+        if (now - lastUpdated > maxPostAgeMs) {
+          removed++;
+          await delKey(key);
+          const knownId = persistedId ?? postIdByUri.get(uri);
+          if (knownId !== undefined) {
+            await removePostId(uri, knownId);
+          }
           continue;
         }
+
+        let postId = postIdByUri.get(uri);
+        if (postId === undefined && persistedId !== undefined) {
+          postId = persistedId;
+          postIdByUri.set(uri, postId);
+          uriByPostId.set(postId, uri);
+        }
+        if (postId === undefined) {
+          postId = allocatePostId(uri);
+        } else {
+          uriByPostId.set(postId, uri);
+          if (!postUrlById.has(postId)) {
+            const resolvedUrl = toPostUrl(uri);
+            postUrlById.set(postId, resolvedUrl ?? null);
+          }
+        }
+
+        const stats: PostStats = {
+          likes,
+          reposts,
+          lastUpdated,
+          id: postId,
+        };
+        postStats.set(uri, stats);
+        highestId = Math.max(highestId, postId);
+
+        const persistedSnapshot = persisted as PersistedPostStats;
+        const persistedPayload: PersistedPostStats = {
+          likes: stats.likes,
+          reposts: stats.reposts,
+          lastUpdated: stats.lastUpdated,
+          id: stats.id,
+        };
+
+        const needsRewrite =
+          persistedSnapshot.likes !== persistedPayload.likes ||
+          persistedSnapshot.reposts !== persistedPayload.reposts ||
+          persistedSnapshot.lastUpdated !== persistedPayload.lastUpdated ||
+          persistedSnapshot.id !== persistedPayload.id;
+
+        if (needsRewrite) {
+          void putKey(postKey(uri), persistedPayload);
+        }
+        restored++;
       }
-      await delKey(key);
+      return { loaded: restored, removed, highestId };
     }
+
+    async function restoreLikes(): Promise<void> {
+      const upperBound = `${LIKE_PREFIX}\uffff`;
+      for await (const [key, value] of db.iterator({ gte: LIKE_PREFIX, lt: upperBound })) {
+        const likeId = key.slice(LIKE_PREFIX.length);
+        let postId: number | undefined;
+        if (typeof value === 'number') {
+          postId = value;
+        } else if (typeof value === 'string') {
+          postId = postIdByUri.get(value);
+          if (postId !== undefined) {
+            void putKey(likeKey(likeId), postId);
+          }
+        }
+
+        if (postId !== undefined) {
+          const uri = uriByPostId.get(postId);
+          if (uri && postStats.has(uri)) {
+            activeLikes.set(likeId, postId);
+            continue;
+          }
+        }
+        await delKey(key);
+      }
+    }
+
+    async function restoreReposts(): Promise<void> {
+      const upperBound = `${REPOST_PREFIX}\uffff`;
+      for await (const [key, value] of db.iterator({ gte: REPOST_PREFIX, lt: upperBound })) {
+        const repostId = key.slice(REPOST_PREFIX.length);
+        let postId: number | undefined;
+        if (typeof value === 'number') {
+          postId = value;
+        } else if (typeof value === 'string') {
+          postId = postIdByUri.get(value);
+          if (postId !== undefined) {
+            void putKey(repostKey(repostId), postId);
+          }
+        }
+
+        if (postId !== undefined) {
+          const uri = uriByPostId.get(postId);
+          if (uri && postStats.has(uri)) {
+            activeReposts.set(repostId, postId);
+            continue;
+          }
+        }
+        await delKey(key);
+      }
+    }
+
+    const storedNextPostId = await loadStoredNextPostId();
+    highestSeenPostId = Math.max(highestSeenPostId, await restorePostIdLookups());
+    highestSeenPostId = Math.max(highestSeenPostId, await restorePostUriMappings());
+    highestSeenPostId = Math.max(highestSeenPostId, await restorePostUrls());
+
+    nextPostId = Math.max(storedNextPostId ?? 0, highestSeenPostId + 1, 1);
+
+    const postResult = await restorePosts();
+    removedStale += postResult.removed;
+    highestSeenPostId = Math.max(highestSeenPostId, postResult.highestId);
+    nextPostId = Math.max(nextPostId, highestSeenPostId + 1);
+
+    void putKey(META_NEXT_POST_ID_KEY, nextPostId);
+
+    await restoreLikes();
+    await restoreReposts();
+  });
+
+  if (removedStale > 0) {
+    scheduleCompaction(30_000);
   }
-
-  const storedNextPostId = await loadStoredNextPostId();
-  highestSeenPostId = Math.max(highestSeenPostId, await restorePostIdLookups());
-  highestSeenPostId = Math.max(highestSeenPostId, await restorePostUriMappings());
-  highestSeenPostId = Math.max(highestSeenPostId, await restorePostUrls());
-
-  nextPostId = Math.max(storedNextPostId ?? 0, highestSeenPostId + 1, 1);
-
-  const postResult = await restorePosts();
-  loadedPosts = postResult.loaded;
-  removedStale += postResult.removed;
-  highestSeenPostId = Math.max(highestSeenPostId, postResult.highestId);
-  nextPostId = Math.max(nextPostId, highestSeenPostId + 1);
-
-  void putKey(META_NEXT_POST_ID_KEY, nextPostId);
-
-  await restoreLikes();
-  await restoreReposts();
-
-  await pruneInactivePosts();
 
   console.log(
     `${colors.gray}Recovered ${postStats.size} posts (${activeLikes.size()} likes, ${activeReposts.size()} reposts) from LevelDB` +
@@ -1111,6 +1282,7 @@ async function main(): Promise<void> {
   db = new Level<string, unknown>(dbPath, { valueEncoding: 'json' });
   await db.open();
   await loadState();
+  scheduleStartupMaintenance();
   reportTopPosts('Initial status');
   queueSnapshot('Initial snapshot');
   connect();
