@@ -1230,7 +1230,7 @@ async function loadState(): Promise<void> {
       return { loaded: restored, removed, highestId };
     }
 
-    async function restoreLikes(): Promise<void> {
+    async function restoreLikes(activePostIds: Set<number>): Promise<void> {
       const progress = createProgressLogger('Restoring like associations');
       let recovered = 0;
       let purged = 0;
@@ -1239,22 +1239,25 @@ async function loadState(): Promise<void> {
         progress.tick();
         const likeId = key.slice(LIKE_PREFIX.length);
         let postId: number | undefined;
+        let needsRewrite = false;
         if (typeof value === 'number') {
           postId = value;
         } else if (typeof value === 'string') {
           postId = postIdByUri.get(value);
-          if (postId !== undefined) {
-            void putKey(likeKey(likeId), postId);
-          }
+          needsRewrite = postId !== undefined;
         }
 
-        if (postId !== undefined) {
-          const uri = uriByPostId.get(postId);
-          if (uri && postStats.has(uri)) {
-            activeLikes.set(likeId, postId);
-            recovered++;
-            continue;
+        if (
+          postId !== undefined &&
+          activePostIds.has(postId) &&
+          uriByPostId.has(postId)
+        ) {
+          activeLikes.set(likeId, postId);
+          if (needsRewrite) {
+            void putKey(likeKey(likeId), postId);
           }
+          recovered++;
+          continue;
         }
         await delKey(key);
         purged++;
@@ -1262,7 +1265,7 @@ async function loadState(): Promise<void> {
       progress.done(`${recovered.toLocaleString()} active, ${purged.toLocaleString()} purged`);
     }
 
-    async function restoreReposts(): Promise<void> {
+    async function restoreReposts(activePostIds: Set<number>): Promise<void> {
       const progress = createProgressLogger('Restoring repost associations');
       let recovered = 0;
       let purged = 0;
@@ -1271,22 +1274,25 @@ async function loadState(): Promise<void> {
         progress.tick();
         const repostId = key.slice(REPOST_PREFIX.length);
         let postId: number | undefined;
+        let needsRewrite = false;
         if (typeof value === 'number') {
           postId = value;
         } else if (typeof value === 'string') {
           postId = postIdByUri.get(value);
-          if (postId !== undefined) {
-            void putKey(repostKey(repostId), postId);
-          }
+          needsRewrite = postId !== undefined;
         }
 
-        if (postId !== undefined) {
-          const uri = uriByPostId.get(postId);
-          if (uri && postStats.has(uri)) {
-            activeReposts.set(repostId, postId);
-            recovered++;
-            continue;
+        if (
+          postId !== undefined &&
+          activePostIds.has(postId) &&
+          uriByPostId.has(postId)
+        ) {
+          activeReposts.set(repostId, postId);
+          if (needsRewrite) {
+            void putKey(repostKey(repostId), postId);
           }
+          recovered++;
+          continue;
         }
         await delKey(key);
         purged++;
@@ -1308,8 +1314,12 @@ async function loadState(): Promise<void> {
 
     void putKey(META_NEXT_POST_ID_KEY, nextPostId);
 
-    await restoreLikes();
-    await restoreReposts();
+    const activePostIds = new Set<number>();
+    for (const stats of postStats.values()) {
+      activePostIds.add(stats.id);
+    }
+    await restoreLikes(activePostIds);
+    await restoreReposts(activePostIds);
   });
 
   if (removedStale > 0) {
