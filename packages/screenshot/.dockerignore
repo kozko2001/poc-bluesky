@@ -1,0 +1,45 @@
+# Dependencies
+node_modules
+npm-debug.log
+
+# Build output
+dist
+
+# Tests
+tests
+*.test.ts
+coverage
+
+# Screenshots
+screenshots
+*.png
+*.jpg
+manifest.json
+
+# Documentation
+README.md
+docs
+
+# Version control
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Nix
+flake.nix
+flake.lock
+
+# CI/CD
+.github

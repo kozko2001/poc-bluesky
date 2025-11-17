@@ -1,273 +1,291 @@
-# Bluesky Firehose Event Viewer
+# Bluesky Monorepo
 
-A real-time event viewer for the Bluesky social network using the Jetstream firehose API. This utility connects to Bluesky's public WebSocket stream and displays all events happening across the network in real-time.
+A monorepo containing Bluesky-related tools and services:
 
-## Features
+- **screenshot**: CLI tool to capture screenshots of Bluesky posts
+- **firehose**: Real-time Jetstream firehose event viewer with aggregation
 
-- Real-time streaming of Bluesky events
-- Color-coded output for different event types
-- Support for filtering specific event types
-- Optional like/repost aggregation with top-post reporting
-- No authentication required (public firehose)
-- Auto-reconnection on connection loss
-- Graceful error handling
+## Repository Structure
 
-## Event Types
+```
+bluesky-monorepo/
+├── packages/
+│   ├── screenshot/        # Bluesky screenshot CLI
+│   │   ├── src/
+│   │   ├── tests/
+│   │   ├── Dockerfile
+│   │   └── package.json
+│   └── firehose/          # Bluesky firehose viewer
+│       ├── src/
+│       ├── Dockerfile
+│       └── package.json
+├── k8s/                   # Kubernetes configurations
+│   ├── namespace.yaml     # Unified "bluesky" namespace
+│   ├── screenshot/        # Screenshot deployment configs
+│   └── firehose/          # Firehose deployment configs (with PVC)
+├── .github/
+│   └── workflows/         # CI/CD pipelines
+│       ├── screenshot-ci.yml
+│       └── firehose-ci.yml
+├── package.json           # Root package with build scripts
+├── tsconfig.base.json     # Shared TypeScript configuration
+└── flake.nix              # Unified Nix development environment
+```
 
-The viewer displays the following event types:
+## Quick Start
 
-- **Posts**: New posts and replies
-- **Likes**: When users like posts
-- **Follows**: When users follow each other
-- **Reposts**: When users repost content
-- **Deletes**: When content is deleted
-- **Identity**: Handle and DID updates
-- **Account**: Account status changes
-- **Blocks**: When users block others
-
-## Prerequisites
-
-This project uses Nix flakes for a reproducible development environment. Make sure you have:
-
-- Nix with flakes enabled
-- NixOS or any Linux distribution with Nix installed
-
-## Getting Started
-
-### 1. Enter the Nix development shell
+### Using Nix (Recommended)
 
 ```bash
+# Enter development environment
 nix develop
-```
 
-This will set up Node.js 20, npm, and TypeScript automatically.
+# Install dependencies for all packages
+npm run install:all
 
-### 2. Install dependencies
-
-```bash
-npm install
-```
-
-### 3. Run the firehose viewer
-
-```bash
-npm start
-```
-
-That's it! You should now see real-time events streaming from Bluesky.
-
-## Usage
-
-### View all events (default)
-
-```bash
-npm start
-```
-
-### Filter specific event types
-
-Show only posts:
-```bash
-npm start -- --posts-only
-```
-
-Show only likes:
-```bash
-npm start -- --likes-only
-```
-
-Show only follows:
-```bash
-npm start -- --follows-only
-```
-
-Show only reposts:
-```bash
-npm start -- --reposts-only
-```
-
-Show only deletes:
-```bash
-npm start -- --deletes-only
-```
-
-### Get help
-
-```bash
-npm start -- --help
-```
-
-## Like/Repost Aggregator
-
-For an in-memory tally of likes and reposts per post, run the aggregation script:
-
-```bash
-npm run aggregate
-```
-
-This connects to the same Jetstream firehose, tracks like/repost events, and prints the top posts at a regular interval.
-
-### Aggregator Options
-
-```bash
-npm run aggregate -- --interval-ms 60000 --top 20 --max-posts 200000
-```
-
-- `--interval-ms <ms>`: How often to print the leaderboard (default 30000).
-- `--top <n>`: Number of posts to show per report (default 10).
-- `--max-posts <n>`: Maximum posts kept in memory (default 100000).
-- `--stale-ms <ms>`: Drop posts that have not been updated in this period (default 6 hours).
-- `--state <path>`: LevelDB directory used to persist aggregation state (default `/data/aggregator-db`, overridable via the `STATE_FILE` env var).
-
-Each report includes current process RSS/heap usage and CPU percentage, plus a direct `https://bsky.app/profile/.../post/...` link alongside the source `at://` URI. All counters and active like/repost references are persisted incrementally in a LevelDB database (default `/data/aggregator-db`) so restarts resume immediately without rewriting a monolithic JSON file.
-
-> Running outside Docker? Override the default with `npm run aggregate -- --state ./aggregator-db` (or set `STATE_FILE`) so the tracker stores data in a directory you control.
-
-## Docker
-
-Build the container image (multi-stage build compiles TypeScript ahead of time):
-
-```bash
-docker build -t bluesky-firehose .
-```
-
-Run the aggregator with a host directory mounted at `/data` so the persistent LevelDB survives restarts:
-
-```bash
-docker run --rm -it -v "$(pwd)/data:/data" bluesky-firehose
-```
-
-The container entrypoint runs `node dist/aggregator.js --state /data/aggregator-db` by default. To tweak options, append extra flags after the image name, for example:
-
-```bash
-docker run --rm -it -v "$(pwd)/data:/data" bluesky-firehose --interval-ms 60000 --top 25
-```
-
-Environment variable `STATE_FILE` can override the persisted LevelDB location if needed.
-
-## How It Works
-
-This utility connects to Bluesky's **Jetstream** service, which is a simplified JSON-based firehose API. Unlike the raw AT Protocol firehose (which uses CBOR encoding), Jetstream provides:
-
-- Simple JSON messages over WebSocket
-- No authentication required
-- Significantly smaller message sizes (>99% reduction)
-- Easy-to-parse event structure
-
-The connection is made to: `wss://jetstream2.us-east.bsky.network/subscribe`
-
-### About AT Protocol and Bluesky
-
-The AT Protocol (Authenticated Transfer Protocol) is the underlying protocol powering Bluesky. Key concepts:
-
-- **Firehose**: A real-time stream of all public events across the network
-- **DIDs**: Decentralized Identifiers for users (e.g., `did:plc:...`)
-- **Collections**: Different types of records (posts, likes, follows, etc.)
-- **Jetstream**: A developer-friendly wrapper around the AT Protocol firehose
-
-All data in the firehose is public, which is why no authentication is needed to consume it.
-
-## Understanding the Output
-
-Example output:
-
-```
-[2025-10-16T12:34:56.789Z] [POST] did:plc:abc123...: Just tried Claude Code and it's amazing!
-[2025-10-16T12:34:57.123Z] [LIKE] did:plc:def456... liked at://did:plc:abc123.../app.bsky.feed.post/...
-[2025-10-16T12:34:57.456Z] [FOLLOW] did:plc:ghi789... followed did:plc:jkl012...
-[2025-10-16T12:34:58.789Z] [REPOST] did:plc:mno345... reposted at://...
-[2025-10-16T12:34:59.012Z] [DELETE] app.bsky.feed.post by did:plc:pqr678...
-[2025-10-16T12:34:59.345Z] [IDENTITY] did:plc:stu901... → alice.bsky.social
-```
-
-Color coding:
-- **Blue**: Posts
-- **Magenta**: Likes
-- **Green**: Follows
-- **Yellow**: Reposts and account events
-- **Red**: Deletes and blocks
-- **Cyan**: Identity updates
-- **Gray**: Timestamps and metadata
-
-## Development
-
-### Build only
-
-```bash
+# Build all packages
 npm run build
 ```
 
-### Clean build artifacts
+### Without Nix
 
 ```bash
+# Install dependencies for all packages
+cd packages/screenshot && npm install
+cd ../firehose && npm install
+
+# Or use the convenience script
+npm run install:all
+```
+
+## Packages
+
+### 📸 Screenshot (`packages/screenshot/`)
+
+A CLI tool to capture screenshots of Bluesky posts using Playwright.
+
+**Features:**
+- Single and batch screenshot processing
+- Transparent background support
+- Docker-ready with multi-stage builds
+- Comprehensive test suite
+
+**Quick Usage:**
+```bash
+cd packages/screenshot
+npm run dev -- https://bsky.app/profile/user/post/123
+```
+
+**Docker:**
+```bash
+docker build -t bsky-screenshot packages/screenshot
+docker run -v $(pwd)/screenshots:/app/screenshots bsky-screenshot <url>
+```
+
+See [packages/screenshot/README.md](packages/screenshot/README.md) for detailed documentation.
+
+### 🌊 Firehose (`packages/firehose/`)
+
+Real-time event viewer for Bluesky's Jetstream firehose with like/repost aggregation.
+
+**Features:**
+- Real-time WebSocket streaming
+- Event filtering and color-coded output
+- LevelDB-based state persistence
+- Periodic leaderboard reporting
+
+**Quick Usage:**
+```bash
+cd packages/firehose
+npm start              # Run the event viewer
+npm run aggregate      # Run the aggregator
+```
+
+**Docker:**
+```bash
+docker build -t bluesky-firehose packages/firehose
+docker run -v $(pwd)/data:/data bluesky-firehose
+```
+
+## Development
+
+### Available Scripts
+
+From the root directory:
+
+```bash
+# Install dependencies for all packages
+npm run install:all
+
+# Build all packages
+npm run build
+
+# Build individual packages
+npm run build:screenshot
+npm run build:firehose
+
+# Run screenshot tests
+npm run test:screenshot
+
+# Clean build artifacts
 npm run clean
 ```
 
-### Development mode (rebuild and run)
+### Package-specific Commands
+
+Each package has its own scripts. Navigate to the package directory and use:
+
+**Screenshot:**
+```bash
+cd packages/screenshot
+npm run dev -- <url>    # Development mode
+npm test                # Run tests
+npm run build           # Build TypeScript
+```
+
+**Firehose:**
+```bash
+cd packages/firehose
+npm start               # Build and run viewer
+npm run aggregate       # Build and run aggregator
+npm run dev             # Quick development build
+```
+
+## Docker Builds
+
+Each package has its own Dockerfile and builds independently:
 
 ```bash
-npm run dev
+# Build screenshot Docker image
+docker build -t bsky-screenshot packages/screenshot
+
+# Build firehose Docker image
+docker build -t bluesky-firehose packages/firehose
 ```
 
-## Project Structure
+Both images are multi-stage builds optimized for production deployment.
 
-```
-.
-├── flake.nix           # Nix flake configuration for dev environment
-├── package.json        # Node.js dependencies and scripts
-├── tsconfig.json       # TypeScript configuration
-├── src/
-│   ├── index.ts        # Streaming event viewer
-│   └── aggregator.ts   # Like/repost aggregation script
-├── dist/               # Compiled JavaScript (generated)
-└── README.md           # This file
+## Kubernetes Deployment
+
+### Prerequisites
+
+```bash
+# Create the unified namespace
+kubectl apply -f k8s/namespace.yaml
 ```
 
-## Technical Details
+### Deploy Screenshot Service
 
-- **Language**: TypeScript
-- **Runtime**: Node.js 20
-- **WebSocket Library**: ws
-- **Package Manager**: npm
-- **Build Tool**: TypeScript Compiler (tsc)
-- **Dev Environment**: Nix flakes
+```bash
+kubectl apply -f k8s/screenshot/deployment.yaml
+```
 
-## Troubleshooting
+### Deploy Firehose Service
 
-### Connection Issues
+```bash
+# Create persistent volume claim (for LevelDB storage)
+kubectl apply -f k8s/firehose/pvc.yaml
 
-If you experience connection issues, the viewer will automatically attempt to reconnect after 5 seconds. If problems persist:
+# Deploy the service
+kubectl apply -f k8s/firehose/deployment.yaml
+```
 
-1. Check your internet connection
-2. Verify that `wss://jetstream2.us-east.bsky.network` is accessible
-3. Try one of the other Jetstream endpoints:
-   - `wss://jetstream1.us-east.bsky.network/subscribe`
-   - `wss://jetstream1.us-west.bsky.network/subscribe`
-   - `wss://jetstream2.us-west.bsky.network/subscribe`
+### Namespace
 
-### High Event Volume
+Both services deploy to the unified `bluesky` namespace:
+```bash
+kubectl get pods -n bluesky
+```
 
-The Bluesky network processes over 2,000 events per second. If the output is too fast:
+## CI/CD
 
-1. Use filters to show only specific event types
-2. Pipe output to less: `npm start | less`
-3. Redirect to a file: `npm start > events.log`
+The monorepo uses GitHub Actions with path-based triggers:
 
-## Resources
+### Screenshot Pipeline (`screenshot-ci.yml`)
+**Triggers on:**
+- Changes to `packages/screenshot/**`
+- Changes to `.github/workflows/screenshot-ci.yml`
 
-- [Bluesky Firehose Documentation](https://docs.bsky.app/docs/advanced-guides/firehose)
-- [Jetstream GitHub Repository](https://github.com/bluesky-social/jetstream)
-- [AT Protocol Specification](https://atproto.com/)
-- [Bluesky Documentation](https://docs.bsky.app/)
+**Steps:**
+1. Run unit and integration tests
+2. Build TypeScript
+3. Build and push Docker image to Harbor
+4. Update `k8s/screenshot/deployment.yaml` with new SHA
+
+### Firehose Pipeline (`firehose-ci.yml`)
+**Triggers on:**
+- Changes to `packages/firehose/**`
+- Changes to `.github/workflows/firehose-ci.yml`
+
+**Steps:**
+1. Build TypeScript
+2. Build and push Docker image to Harbor
+3. Update `k8s/firehose/deployment.yaml` with new SHA
+
+### Required Secrets
+
+Configure in GitHub repository settings:
+- `HARBOR_USERNAME` - Harbor registry username
+- `HARBOR_PASSWORD` - Harbor registry password
+
+## Technology Stack
+
+### Common
+- **Language**: TypeScript 5.7.2
+- **Runtime**: Node.js 20+
+- **Module System**: ES Modules (ESM)
+- **Container**: Docker multi-stage builds
+- **Orchestration**: Kubernetes
+- **Registry**: Harbor (harbor.allocsoc.net)
+
+### Screenshot-specific
+- **Browser Automation**: Playwright (Chromium)
+- **CLI Framework**: Commander
+- **Testing**: Vitest
+
+### Firehose-specific
+- **WebSocket Client**: ws
+- **Database**: LevelDB (via level package)
+- **Persistence**: Kubernetes PVC with rook-ceph-block
+
+## Architecture Decisions
+
+### Module System
+Both packages use **ES Modules** (ESM) for modern JavaScript standards and better tree-shaking. Import statements require `.js` extensions for local modules.
+
+### Monorepo Structure
+- **Simple approach**: No complex workspace tooling (npm workspaces, pnpm, Turborepo)
+- **Independent packages**: Each package manages its own dependencies
+- **Shared configuration**: Base TypeScript config and unified dev environment
+
+### Kubernetes Namespace
+- **Unified namespace**: Both services deploy to `bluesky` namespace
+- **Isolation via labels**: Services distinguished by labels and names
+- **Separate deployments**: Each service has its own deployment config
+
+### Docker Strategy
+- **Per-package Dockerfiles**: Each package maintains its own optimized Dockerfile
+- **Independent builds**: CI/CD builds each package separately
+- **Context-aware**: Workflows set correct build context (`packages/*/`)
+
+## Contributing
+
+1. Make changes to the relevant package (`packages/screenshot` or `packages/firehose`)
+2. Test locally:
+   ```bash
+   cd packages/<package-name>
+   npm test          # (screenshot only)
+   npm run build
+   ```
+3. Submit a pull request
+4. CI/CD will automatically test and build affected packages
 
 ## License
 
 MIT
 
-## Contributing
+## Links
 
-Feel free to open issues or submit pull requests!
-
-## Stopping the Viewer
-
-Press `Ctrl+C` to gracefully shut down the viewer.
+- **Screenshot Package**: [packages/screenshot/README.md](packages/screenshot/README.md)
+- **Harbor Registry**: https://harbor.allocsoc.net
+- **Bluesky**: https://bsky.app

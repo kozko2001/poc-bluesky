@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bsky-screenshot
+  namespace: bluesky
+  labels:
+    app: bsky-screenshot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bsky-screenshot
+  template:
+    metadata:
+      labels:
+        app: bsky-screenshot
+    spec:
+      containers:
+      - name: bsky-screenshot
+        image: harbor.allocsoc.net/bluesky/bsky-screenshot:latest
+        imagePullPolicy: Always
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: screenshots
+          mountPath: /app/screenshots
+      volumes:
+      - name: screenshots
+        emptyDir: {}
+      restartPolicy: Always
