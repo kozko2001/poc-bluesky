@@ -3,15 +3,18 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
+# Copy root tsconfig.base.json for extends to work
+COPY tsconfig.base.json /tsconfig.base.json
+
 # Copy package files
-COPY package*.json ./
-COPY tsconfig.json ./
+COPY packages/screenshot/package*.json ./
+COPY packages/screenshot/tsconfig.json ./
 
 # Install dependencies (including devDependencies for building)
 RUN npm ci
 
 # Copy source code
-COPY src ./src
+COPY packages/screenshot/src ./src
 
 # Build TypeScript
 RUN npm run build
@@ -39,7 +42,7 @@ RUN addgroup -g 1001 -S nodejs && \
 WORKDIR /app
 
 # Copy package files and install production dependencies only
-COPY package*.json ./
+COPY packages/screenshot/package*.json ./
 RUN npm ci --omit=dev
 
 # Copy built application from builder

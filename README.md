@@ -78,7 +78,7 @@ npm run dev -- https://bsky.app/profile/user/post/123
 
 **Docker:**
 ```bash
-docker build -t bsky-screenshot packages/screenshot
+docker build -f packages/screenshot/Dockerfile -t bsky-screenshot .
 docker run -v $(pwd)/screenshots:/app/screenshots bsky-screenshot <url>
 ```
 
@@ -103,7 +103,7 @@ npm run aggregate      # Run the aggregator
 
 **Docker:**
 ```bash
-docker build -t bluesky-firehose packages/firehose
+docker build -f packages/firehose/Dockerfile -t bluesky-firehose .
 docker run -v $(pwd)/data:/data bluesky-firehose
 ```
 
@@ -153,14 +153,14 @@ npm run dev             # Quick development build
 
 ## Docker Builds
 
-Each package has its own Dockerfile and builds independently:
+Each package has its own Dockerfile and builds independently. Build from the repository root:
 
 ```bash
 # Build screenshot Docker image
-docker build -t bsky-screenshot packages/screenshot
+docker build -f packages/screenshot/Dockerfile -t bsky-screenshot .
 
 # Build firehose Docker image
-docker build -t bluesky-firehose packages/firehose
+docker build -f packages/firehose/Dockerfile -t bluesky-firehose .
 ```
 
 Both images are multi-stage builds optimized for production deployment.

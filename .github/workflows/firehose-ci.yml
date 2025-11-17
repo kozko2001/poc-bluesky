@@ -63,7 +63,8 @@ jobs:
       - name: Build, tag, and push image to Harbor
         uses: docker/build-push-action@v5
         with:
-          context: ./packages/firehose
+          context: .
+          file: ./packages/firehose/Dockerfile
           push: true
           tags: harbor.allocsoc.net/bluesky/poc:${{ github.sha }}
           cache-from: type=gha
