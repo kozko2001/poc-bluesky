@@ -109,5 +109,7 @@ jobs:
             echo "No changes to commit"
           else
             git commit -m "Update screenshot image to ${{ github.sha }}"
+            # Pull with rebase to handle concurrent updates from other workflows
+            git pull --rebase origin main
             git push
           fi
